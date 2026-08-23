@@ -142,6 +142,81 @@ class HookTests(unittest.TestCase):
         updated = H.inject_hyprland_hook(original)
         self.assertTrue(updated.endswith('pcall(require, "hypr.homing")\n'))
 
+    def test_remove_reverses_hyprmoncfg_inject(self):
+        original = (
+            "require(\"hypr.autostart\")\n\n"
+            "-- Added by hyprmoncfg: keep last.\n"
+            "dofile(os.getenv(\"HOME\") .. \"/hyprmoncfg-monitors.lua\")\n"
+        )
+        updated = H.inject_hyprland_hook(original)
+        restored = H.remove_hyprland_hook(updated)
+        self.assertNotIn("hypr.homing", restored)
+        self.assertIn("hyprmoncfg", restored)
+        self.assertIn("hypr.autostart", restored)
+
+    def test_remove_reverses_append(self):
+        original = 'require("hypr.bindings")\n'
+        restored = H.remove_hyprland_hook(H.inject_hyprland_hook(original))
+        self.assertEqual(restored, original)
+
+    def test_remove_is_idempotent(self):
+        original = 'require("hypr.bindings")\n'
+        self.assertEqual(H.remove_hyprland_hook(original), original)
+
+    def test_write_lua_does_not_touch_hyprland(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            hypr = home / ".config" / "hypr"
+            hypr.mkdir(parents=True)
+            hyprland = hypr / "hyprland.lua"
+            original = 'require("hypr.bindings")\n'
+            hyprland.write_text(original, encoding="utf-8")
+            paths = H.Paths(
+                home=home,
+                assignments=home / ".config" / "omarchy" / "homing" / "assignments.json",
+                lua=hypr / "homing.lua",
+                hyprland_lua=hyprland,
+            )
+            H.write_lua(paths, H.empty_store())
+            self.assertEqual(hyprland.read_text(encoding="utf-8"), original)
+            self.assertTrue((hypr / "homing.lua").is_file())
+            self.assertFalse(H.hyprland_hook_backup(hyprland).exists())
+
+    def test_ensure_keeps_existing_homing_backup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "hyprland.lua"
+            bak = H.hyprland_hook_backup(path)
+            path.write_text('require("hypr.bindings")\n', encoding="utf-8")
+            bak.write_text("ORIGINAL\n", encoding="utf-8")
+            self.assertTrue(H.ensure_hyprland_hook(path))
+            self.assertEqual(bak.read_text(encoding="utf-8"), "ORIGINAL\n")
+            self.assertIn("hypr.homing", path.read_text(encoding="utf-8"))
+
+    def test_uninstall_files_removes_hook_and_generated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            hypr = home / ".config" / "hypr"
+            homing_dir = home / ".config" / "omarchy" / "homing"
+            hypr.mkdir(parents=True)
+            homing_dir.mkdir(parents=True)
+            hyprland = hypr / "hyprland.lua"
+            hyprland.write_text('require("hypr.bindings")\n', encoding="utf-8")
+            paths = H.Paths(
+                home=home,
+                assignments=homing_dir / "assignments.json",
+                lua=hypr / "homing.lua",
+                hyprland_lua=hyprland,
+            )
+            H.ensure_hyprland_hook(hyprland)
+            H.write_lua(paths, H.empty_store())
+            H.save_store(paths.assignments, H.empty_store())
+            changed = H.uninstall_files(paths)
+            self.assertNotIn("hypr.homing", hyprland.read_text(encoding="utf-8"))
+            self.assertFalse(paths.lua.exists())
+            self.assertFalse(paths.assignments.exists())
+            self.assertFalse(homing_dir.exists())
+            self.assertTrue(any(str(hyprland) == item for item in changed))
+
 
 class FlagTests(unittest.TestCase):
     def test_equals_form(self):

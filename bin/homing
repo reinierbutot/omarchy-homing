@@ -380,6 +380,16 @@ def backup_file(path: Path) -> None:
         shutil.copy2(path, path.with_suffix(path.suffix + ".bak"))
 
 
+def hyprland_hook_backup(path: Path) -> Path:
+    return path.with_name(path.name + ".homing.bak")
+
+
+def backup_hyprland_hook(path: Path) -> None:
+    bak = hyprland_hook_backup(path)
+    if path.is_file() and not bak.exists():
+        shutil.copy2(path, bak)
+
+
 def atomic_write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
@@ -568,6 +578,8 @@ def generate_lua(store: dict[str, Any]) -> str:
 
 
 HYPRLAND_HOOK = '-- Homing plugin: generated app → workspace assignments.\npcall(require, "hypr.homing")\n'
+HYPRLAND_HOOK_COMMENT = "-- Homing plugin: generated app → workspace assignments."
+HYPRLAND_HOOK_CALL = 'pcall(require, "hypr.homing")'
 
 
 def hyprland_has_hook(text: str) -> bool:
@@ -586,6 +598,22 @@ def inject_hyprland_hook(text: str) -> str:
     return text + hook
 
 
+def remove_hyprland_hook(text: str) -> str:
+    kept: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped in {HYPRLAND_HOOK_COMMENT, HYPRLAND_HOOK_CALL}:
+            continue
+        kept.append(line)
+    result = "\n".join(kept)
+    if text.endswith("\n") or result:
+        if not result.endswith("\n"):
+            result += "\n"
+    while "\n\n\n" in result:
+        result = result.replace("\n\n\n", "\n\n")
+    return result
+
+
 def ensure_hyprland_hook(path: Path) -> bool:
     if not path.is_file():
         return False
@@ -593,7 +621,7 @@ def ensure_hyprland_hook(path: Path) -> bool:
     updated = inject_hyprland_hook(original)
     if updated == original:
         return False
-    backup_file(path)
+    backup_hyprland_hook(path)
     atomic_write(path, updated)
     return True
 
@@ -601,7 +629,72 @@ def ensure_hyprland_hook(path: Path) -> bool:
 def write_lua(paths: Paths, store: dict[str, Any]) -> None:
     backup_file(paths.lua)
     atomic_write(paths.lua, generate_lua(store))
-    ensure_hyprland_hook(paths.hyprland_lua)
+
+
+def maybe_install_hyprland_hook(paths: Paths, store: dict[str, Any], *, force: bool = False) -> dict[str, Any]:
+    """Ask before touching hyprland.lua. Never writes that file unless the user picks Yes."""
+    if not paths.hyprland_lua.is_file():
+        store["hyprlandHook"] = "missing-config"
+        notify(
+            "Homing",
+            f"No {paths.hyprland_lua} to hook. Add {HYPRLAND_HOOK_CALL} yourself if you use Hyprland Lua.",
+            ICON_WARN,
+        )
+        return store
+    current = paths.hyprland_lua.read_text(encoding="utf-8")
+    if hyprland_has_hook(current):
+        store["hyprlandHook"] = "installed"
+        return store
+    if not force and store.get("hyprlandHook") == "declined":
+        return store
+    choice = menu_select(
+        "Allow Homing to add one line to ~/.config/hypr/hyprland.lua?",
+        [
+            f"{ICON_OK}\tYes, add {HYPRLAND_HOOK_CALL}\tyes",
+            f"{ICON_EDIT}\tNo, I'll add that line myself\tno",
+        ],
+    )
+    if choice == "yes":
+        ensure_hyprland_hook(paths.hyprland_lua)
+        store["hyprlandHook"] = "installed"
+        return store
+    if choice == "no":
+        store["hyprlandHook"] = "declined"
+    notify(
+        "Homing",
+        f'Assignment saved. Add {HYPRLAND_HOOK_CALL} to ~/.config/hypr/hyprland.lua so rules apply.',
+        ICON_WARN,
+    )
+    return store
+
+
+def generated_paths(paths: Paths) -> list[Path]:
+    return [
+        paths.lua,
+        paths.lua.with_suffix(paths.lua.suffix + ".bak"),
+        paths.assignments,
+        paths.assignments.with_suffix(paths.assignments.suffix + ".bak"),
+    ]
+
+
+def uninstall_files(paths: Paths) -> list[str]:
+    changed: list[str] = []
+    if paths.hyprland_lua.is_file():
+        original = paths.hyprland_lua.read_text(encoding="utf-8")
+        updated = remove_hyprland_hook(original)
+        if updated != original:
+            backup_hyprland_hook(paths.hyprland_lua)
+            atomic_write(paths.hyprland_lua, updated)
+            changed.append(str(paths.hyprland_lua))
+    for path in generated_paths(paths):
+        if path.is_file():
+            path.unlink()
+            changed.append(str(path))
+    parent = paths.assignments.parent
+    if parent.is_dir() and not any(parent.iterdir()):
+        parent.rmdir()
+        changed.append(str(parent))
+    return changed
 
 
 def hyprctl_json(args: list[str]) -> Any:
@@ -819,6 +912,7 @@ def cmd_pin(paths: Paths) -> int:
     else:
         assignment = build_class_assignment(window, workspace)
     upsert_assignment(store, assignment)
+    store = maybe_install_hyprland_hook(paths, store)
     errors = persist(paths, store)
     move_window(workspace)
     label = assignment["label"]
@@ -914,17 +1008,71 @@ def cmd_reload(paths: Paths) -> int:
     return 0
 
 
+def cmd_hook(paths: Paths) -> int:
+    store = load_store(paths.assignments)
+    if paths.hyprland_lua.is_file() and hyprland_has_hook(paths.hyprland_lua.read_text(encoding="utf-8")):
+        store["hyprlandHook"] = "installed"
+        save_store(paths.assignments, store)
+        notify("Homing", "Hyprland already loads homing.lua")
+        print(f"Hook already present in {paths.hyprland_lua}")
+        return 0
+    store = maybe_install_hyprland_hook(paths, store, force=True)
+    save_store(paths.assignments, store)
+    if store.get("hyprlandHook") == "installed":
+        errors = reload_hyprland()
+        if errors:
+            print(errors, file=sys.stderr)
+            return 1
+        print(f"Added hook to {paths.hyprland_lua}")
+        return 0
+    print('No hook written. Add pcall(require, "hypr.homing") to ~/.config/hypr/hyprland.lua yourself.')
+    return 0
+
+
+def cmd_uninstall(paths: Paths) -> int:
+    store = load_store(paths.assignments)
+    count = len(store.get("assignments") or [])
+    extra = f" and {count} assignment(s)" if count else ""
+    choice = menu_select(
+        "Remove Homing's generated files and Hyprland hook?",
+        [
+            f"{ICON_STOP}\tYes, remove generated files{extra} and the hyprland.lua hook\tyes",
+            f"{ICON_APP}\tKeep everything\tno",
+        ],
+    )
+    if choice != "yes":
+        return 0
+    changed = uninstall_files(paths)
+    if changed:
+        reload_hyprland()
+    notify(
+        "Homing",
+        "Generated files removed. Then run: omarchy plugin remove reinier.homing",
+        ICON_STOP,
+    )
+    if changed:
+        print("Removed:")
+        for path in changed:
+            print(f"  {path}")
+    else:
+        print("Nothing to remove.")
+    print("Disable the plugin with: omarchy plugin remove reinier.homing")
+    return 0
+
+
 def usage() -> str:
     return """Usage: homing [command]
 
 Home the focused app so it always opens on the same Hyprland workspace.
 
 Commands:
-  pin       Home the focused window (default)
-  unpin     Remove an assignment
-  list      Print saved assignments
-  status    Show the focused window's identity and assignment
-  reload    Rewrite ~/.config/hypr/homing.lua and reload Hyprland
+  pin        Home the focused window (default)
+  unpin      Remove an assignment
+  list       Print saved assignments
+  status     Show the focused window's identity and assignment
+  reload     Rewrite ~/.config/hypr/homing.lua and reload Hyprland
+  hook       Ask to add the one-line hyprland.lua loader
+  uninstall  Remove generated files and the hyprland.lua hook (asks first)
 """
 
 
@@ -945,6 +1093,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_status(paths)
     if command == "reload":
         return cmd_reload(paths)
+    if command == "hook":
+        return cmd_hook(paths)
+    if command == "uninstall":
+        return cmd_uninstall(paths)
     print(usage(), file=sys.stderr)
     return 2
 
