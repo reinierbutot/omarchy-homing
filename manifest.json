@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "reinier.homing",
+  "name": "Homing",
+  "version": "1.0.0",
+  "author": "reinier",
+  "license": "MIT",
+  "description": "Home an app to a Hyprland workspace from the focused window. Chromium profiles can be assigned separately.",
+  "kinds": ["overlay"],
+  "activation": "on-demand",
+  "entryPoints": {
+    "overlay": "Overlay.qml"
+  }
+}

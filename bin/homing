@@ -1,0 +1,953 @@
+#!/usr/bin/python3
+"""Home the focused app to a Hyprland workspace.
+
+Homing is an Omarchy plugin. The interactive flow uses omarchy-menu-select
+and omarchy-menu-input (omarchy-shell overlays), then writes a generated
+Lua module that Hyprland loads from ~/.config/hypr/homing.lua.
+
+Chromium-based browsers share one window class across profiles, so profile
+assignments are applied by tagging the window from /proc before window
+rules run.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+PLUGIN_ID = "reinier.homing"
+ASSIGNMENTS_VERSION = 1
+NUMERIC_WORKSPACES = list(range(1, 11))
+RE2_SPECIAL = set(r"\.^$|()[]{}*+?")
+WORKSPACE_RE = re.compile(r"^(?:\d+|special:[A-Za-z0-9_-]+|name:[A-Za-z0-9_-]+|[A-Za-z0-9_-]+)$")
+
+ICON_HOME = "󰋜"
+ICON_APP = ""
+ICON_BROWSER = ""
+ICON_PROFILE = ""
+ICON_EDIT = ""
+ICON_STOP = ""
+ICON_WARN = ""
+ICON_OK = ""
+
+
+@dataclass(frozen=True)
+class Paths:
+    home: Path
+    assignments: Path
+    lua: Path
+    hyprland_lua: Path
+
+    @classmethod
+    def from_home(cls, home: Path | None = None) -> Paths:
+        home = Path(home) if home is not None else Path.home()
+        config = Path(os.environ.get("XDG_CONFIG_HOME", home / ".config"))
+        return cls(
+            home=home,
+            assignments=config / "omarchy" / "homing" / "assignments.json",
+            lua=config / "hypr" / "homing.lua",
+            hyprland_lua=config / "hypr" / "hyprland.lua",
+        )
+
+
+@dataclass(frozen=True)
+class BrowserFamily:
+    id: str
+    label: str
+    class_re: re.Pattern[str]
+    class_regex: str
+    classes: tuple[str, ...]
+    user_data_dir: Path
+
+
+BROWSER_FAMILIES = (
+    BrowserFamily(
+        id="chromium",
+        label="Chromium",
+        class_re=re.compile(r"^(chromium|chromium-browser)$", re.I),
+        class_regex=r"^([Cc]hromium(-browser)?)$",
+        classes=("chromium", "Chromium", "chromium-browser", "Chromium-browser"),
+        user_data_dir=Path.home() / ".config" / "chromium",
+    ),
+    BrowserFamily(
+        id="chrome",
+        label="Google Chrome",
+        class_re=re.compile(r"^(google-chrome(-stable)?)$", re.I),
+        class_regex=r"^([Gg]oogle-chrome(-stable)?)$",
+        classes=("google-chrome", "Google-chrome", "google-chrome-stable"),
+        user_data_dir=Path.home() / ".config" / "google-chrome",
+    ),
+    BrowserFamily(
+        id="brave",
+        label="Brave",
+        class_re=re.compile(r"^(brave-browser|brave)$", re.I),
+        class_regex=r"^([Bb]rave(-browser)?)$",
+        classes=("brave-browser", "Brave-browser", "brave", "Brave"),
+        user_data_dir=Path.home() / ".config" / "BraveSoftware" / "Brave-Browser",
+    ),
+    BrowserFamily(
+        id="edge",
+        label="Microsoft Edge",
+        class_re=re.compile(r"^(microsoft-edge(-stable)?)$", re.I),
+        class_regex=r"^([Mm]icrosoft-edge(-stable)?)$",
+        classes=("microsoft-edge", "Microsoft-edge", "microsoft-edge-stable"),
+        user_data_dir=Path.home() / ".config" / "microsoft-edge",
+    ),
+    BrowserFamily(
+        id="vivaldi",
+        label="Vivaldi",
+        class_re=re.compile(r"^vivaldi-stable$", re.I),
+        class_regex=r"^([Vv]ivaldi-stable)$",
+        classes=("vivaldi-stable", "Vivaldi-stable"),
+        user_data_dir=Path.home() / ".config" / "vivaldi",
+    ),
+    BrowserFamily(
+        id="helium",
+        label="Helium",
+        class_re=re.compile(r"^helium$", re.I),
+        class_regex=r"^([Hh]elium)$",
+        classes=("helium", "Helium"),
+        user_data_dir=Path.home() / ".config" / "net.imput.helium",
+    ),
+)
+
+
+@dataclass
+class Window:
+    address: str
+    class_name: str
+    initial_class: str
+    title: str
+    pid: int | None
+    workspace: str
+
+
+@dataclass
+class BrowserProfile:
+    directory: str
+    name: str
+    user_data_dir: Path
+
+
+def family_for_class(class_name: str) -> BrowserFamily | None:
+    for family in BROWSER_FAMILIES:
+        if family.class_re.match(class_name or ""):
+            return family
+    return None
+
+
+def re2_escape(value: str) -> str:
+    return "".join("\\" + ch if ch in RE2_SPECIAL else ch for ch in value)
+
+
+def class_regex_for(class_name: str) -> str:
+    family = family_for_class(class_name)
+    if family:
+        return family.class_regex
+    return f"^({re2_escape(class_name)})$"
+
+
+def lua_string(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def assignment_id(kind: str, class_name: str, profile_directory: str | None = None) -> str:
+    family = family_for_class(class_name)
+    family_id = family.id if family else class_name
+    if kind == "profile":
+        return f"profile:{family_id}:{profile_directory}"
+    return f"class:{family_id}"
+
+
+def tag_for_profile(class_name: str, profile_directory: str) -> str:
+    family = family_for_class(class_name)
+    family_id = family.id if family else slug(class_name)
+    return f"homing-{family_id}-{slug(profile_directory)}"
+
+
+def slug(value: str) -> str:
+    text = re.sub(r"[^A-Za-z0-9]+", "-", value.strip().lower()).strip("-")
+    return text or "profile"
+
+
+def read_cmdline(pid: int) -> str:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return ""
+    if raw.count(b"\0") > 1:
+        return raw.replace(b"\0", b"\n").decode("utf-8", "replace")
+    return raw.replace(b"\0", b" ").decode("utf-8", "replace").strip()
+
+
+def parse_flag(cmdline: str, flag: str) -> str | None:
+    if not cmdline:
+        return None
+    joined = cmdline.replace("\n", " ")
+    match = re.search(rf"{re.escape(flag)}=([^\n]+)", cmdline)
+    if match:
+        value = match.group(1).strip()
+        cut = re.search(r"\s+--", value)
+        if cut:
+            value = value[: cut.start()].strip()
+        return value or None
+    match = re.search(rf"{re.escape(flag)}(?:\n|\s+)(\S+(?: \S+?)?)", cmdline)
+    if match:
+        return match.group(1).strip() or None
+    match = re.search(rf"{re.escape(flag)}=(\S+(?: \d+)?)", joined)
+    if match:
+        return match.group(1).strip() or None
+    return None
+
+
+def iter_pid_chain(pid: int, limit: int = 8) -> list[int]:
+    chain: list[int] = []
+    current = pid
+    seen: set[int] = set()
+    while current and current > 1 and current not in seen and len(chain) < limit:
+        seen.add(current)
+        chain.append(current)
+        try:
+            status = Path(f"/proc/{current}/status").read_text(errors="replace")
+        except OSError:
+            break
+        match = re.search(r"^PPid:\s*(\d+)", status, re.M)
+        current = int(match.group(1)) if match else 0
+    return chain
+
+
+def proc_text(pid: int, name: str) -> str:
+    try:
+        return Path(f"/proc/{pid}/{name}").read_text(errors="replace")
+    except OSError:
+        return ""
+
+
+def fd_paths(pid: int) -> list[str]:
+    directory = Path(f"/proc/{pid}/fd")
+    if not directory.is_dir():
+        return []
+    paths: list[str] = []
+    try:
+        entries = list(directory.iterdir())
+    except OSError:
+        return []
+    for entry in entries:
+        try:
+            paths.append(str(entry.readlink()))
+        except OSError:
+            continue
+    return paths
+
+
+def profile_directories_from_local_state(user_data_dir: Path) -> dict[str, str]:
+    names = {"Default": "Default", "Guest Profile": "Guest"}
+    local_state = user_data_dir / "Local State"
+    if not local_state.is_file():
+        return names
+    try:
+        data = json.loads(local_state.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return names
+    cache = data.get("profile", {}).get("info_cache", {})
+    if isinstance(cache, dict):
+        for directory, info in cache.items():
+            if not isinstance(directory, str) or directory == "System Profile":
+                continue
+            label = directory
+            if isinstance(info, dict):
+                label = str(info.get("name") or directory)
+            names[directory] = label
+    return names
+
+
+def detect_user_data_dir(pid: int | None, family: BrowserFamily | None) -> Path | None:
+    if pid:
+        for candidate in iter_pid_chain(pid):
+            cmdline = read_cmdline(candidate)
+            explicit = parse_flag(cmdline, "--user-data-dir")
+            if explicit:
+                return Path(explicit).expanduser()
+            maps = proc_text(candidate, "maps")
+            fds = "\n".join(fd_paths(candidate))
+            blob = maps + "\n" + fds
+            if family and str(family.user_data_dir) in blob:
+                return family.user_data_dir
+            match = re.search(r"(/home/[^/\s]+/\.config/(?:chromium|google-chrome|BraveSoftware/Brave-Browser|microsoft-edge|vivaldi|net\.imput\.helium))", blob)
+            if match:
+                return Path(match.group(1))
+    if family and family.user_data_dir.is_dir():
+        return family.user_data_dir
+    return None
+
+
+def detect_profile_directory(pid: int | None, user_data_dir: Path | None) -> str | None:
+    if not pid:
+        return None
+    known = list(profile_directories_from_local_state(user_data_dir).keys()) if user_data_dir else ["Default"]
+    for candidate in iter_pid_chain(pid):
+        cmdline = read_cmdline(candidate)
+        flagged = parse_flag(cmdline, "--profile-directory")
+        if flagged:
+            return flagged
+        blob = proc_text(candidate, "maps") + "\n" + "\n".join(fd_paths(candidate))
+        if not user_data_dir:
+            continue
+        best: str | None = None
+        best_len = -1
+        root = str(user_data_dir)
+        for directory in known:
+            needle = f"{root}/{directory}/"
+            if needle in blob and len(needle) > best_len:
+                best = directory
+                best_len = len(needle)
+        if best:
+            return best
+    return None
+
+
+def detect_browser_profile(window: Window) -> BrowserProfile | None:
+    family = family_for_class(window.class_name)
+    if not family:
+        return None
+    user_data_dir = detect_user_data_dir(window.pid, family)
+    if user_data_dir is None:
+        user_data_dir = family.user_data_dir
+    directory = detect_profile_directory(window.pid, user_data_dir) or "Default"
+    names = profile_directories_from_local_state(user_data_dir)
+    return BrowserProfile(directory=directory, name=names.get(directory, directory), user_data_dir=user_data_dir)
+
+
+def empty_store() -> dict[str, Any]:
+    return {"version": ASSIGNMENTS_VERSION, "assignments": []}
+
+
+def load_store(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return empty_store()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return empty_store()
+    if not isinstance(data, dict):
+        return empty_store()
+    assignments = data.get("assignments")
+    if not isinstance(assignments, list):
+        data["assignments"] = []
+    data["version"] = ASSIGNMENTS_VERSION
+    return data
+
+
+def upsert_assignment(store: dict[str, Any], assignment: dict[str, Any]) -> dict[str, Any]:
+    rows = [row for row in store.get("assignments", []) if row.get("id") != assignment["id"]]
+    rows.append(assignment)
+    rows.sort(key=lambda row: (row.get("kind") != "class", str(row.get("id"))))
+    store["assignments"] = rows
+    return store
+
+
+def remove_assignment(store: dict[str, Any], assignment_id_value: str) -> dict[str, Any]:
+    store["assignments"] = [row for row in store.get("assignments", []) if row.get("id") != assignment_id_value]
+    return store
+
+
+def find_assignment(store: dict[str, Any], window: Window, profile: BrowserProfile | None = None) -> dict[str, Any] | None:
+    rows = store.get("assignments", [])
+    if profile:
+        profile_id = assignment_id("profile", window.class_name, profile.directory)
+        for row in rows:
+            if row.get("id") == profile_id:
+                return row
+    class_id = assignment_id("class", window.class_name)
+    family = family_for_class(window.class_name)
+    for row in rows:
+        if row.get("id") == class_id:
+            return row
+        if family and row.get("kind") == "class" and family_for_class(str(row.get("class") or "")) is family:
+            return row
+    return None
+
+
+def backup_file(path: Path) -> None:
+    if path.is_file():
+        shutil.copy2(path, path.with_suffix(path.suffix + ".bak"))
+
+
+def atomic_write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+
+
+def save_store(path: Path, store: dict[str, Any]) -> None:
+    backup_file(path)
+    atomic_write(path, json.dumps(store, indent=2, sort_keys=False) + "\n")
+
+
+LUA_PROFILE_RUNTIME = r'''
+local function homing_read(path)
+  local file = io.open(path, "r")
+  if not file then return nil end
+  local data = file:read("*a")
+  file:close()
+  return data
+end
+
+local function homing_ppid(pid)
+  local status = homing_read("/proc/" .. tostring(pid) .. "/status")
+  if not status then return nil end
+  return tonumber(status:match("PPid:%s*(%d+)"))
+end
+
+local function homing_profile_from_cmdline(text)
+  if not text or text == "" then return nil end
+  local dir = text:match("%-%-profile%-directory=([^\n]+)")
+  if dir then
+    local cut = dir:find(" %-%-", 1, true)
+    if cut then dir = dir:sub(1, cut - 1) end
+    dir = dir:match("^%s*(.-)%s*$")
+    if dir and dir ~= "" then return dir end
+  end
+  dir = text:match("%-%-profile%-directory[\n ]+([^\n]+)")
+  if dir then
+    dir = dir:match("^(%S+(?: %d+)?)") or dir
+    dir = dir:match("^%s*(.-)%s*$")
+    if dir and dir ~= "" then return dir end
+  end
+  return nil
+end
+
+local function homing_detect_profile(pid, user_data_dir, profiles)
+  local current = pid
+  for _ = 1, 8 do
+    if not current or current <= 1 then break end
+    local cmdline = homing_read("/proc/" .. tostring(current) .. "/cmdline") or ""
+    cmdline = cmdline:gsub("%z", "\n")
+    local flagged = homing_profile_from_cmdline(cmdline)
+    if flagged then return flagged end
+    local maps = homing_read("/proc/" .. tostring(current) .. "/maps") or ""
+    local best, best_len = nil, -1
+    for _, profile in ipairs(profiles) do
+      local needle = user_data_dir .. "/" .. profile.directory .. "/"
+      if maps:find(needle, 1, true) and #needle > best_len then
+        best = profile.directory
+        best_len = #needle
+      end
+    end
+    if best then return best end
+    current = homing_ppid(current)
+  end
+  return nil
+end
+
+local function homing_class_matches(class_name, classes)
+  local needle = string.lower(tostring(class_name or ""))
+  for _, item in ipairs(classes) do
+    if needle == string.lower(item) then return true end
+  end
+  return false
+end
+'''
+
+
+def generate_lua(store: dict[str, Any]) -> str:
+    assignments = store.get("assignments") or []
+    lines = [
+        "-- Homing autogenerated rules. Do not edit.",
+        "-- Source of truth: ~/.config/omarchy/homing/assignments.json",
+        "-- Rewrite with the Homing plugin (`homing pin` / `homing unpin`).",
+        "",
+    ]
+    class_rows = [row for row in assignments if row.get("kind") == "class"]
+    profile_rows = [row for row in assignments if row.get("kind") == "profile"]
+
+    if not assignments:
+        lines += ["-- No assignments yet.", "return true", ""]
+        return "\n".join(lines)
+
+    for row in class_rows:
+        name = f"homing-class-{slug(str(row.get('class') or 'app'))}"
+        regex = str(row.get("class_regex") or class_regex_for(str(row.get("class") or "")))
+        workspace = str(row.get("workspace"))
+        lines.append(
+            "hl.window_rule({\n"
+            f"  name = {lua_string(name)},\n"
+            f"  match = {{ class = {lua_string(regex)} }},\n"
+            f"  workspace = {lua_string(workspace)},\n"
+            "})"
+        )
+        lines.append("")
+
+    if profile_rows:
+        families: dict[str, dict[str, Any]] = {}
+        for row in profile_rows:
+            class_name = str(row.get("class") or "")
+            family = family_for_class(class_name)
+            family_id = family.id if family else slug(class_name)
+            bucket = families.setdefault(
+                family_id,
+                {
+                    "classes": list(family.classes) if family else [class_name],
+                    "user_data_dir": str(row.get("user_data_dir") or (family.user_data_dir if family else "")),
+                    "profiles": [],
+                },
+            )
+            bucket["profiles"].append(
+                {
+                    "directory": str(row.get("profile_directory") or "Default"),
+                    "tag": str(row.get("tag") or tag_for_profile(class_name, str(row.get("profile_directory") or "Default"))),
+                    "workspace": str(row.get("workspace")),
+                }
+            )
+
+        lines.append(LUA_PROFILE_RUNTIME.rstrip())
+        lines.append("")
+        lines.append("local homing_browsers = {")
+
+        for family_id, bucket in families.items():
+            lines.append("  {")
+            class_list = ", ".join(lua_string(item) for item in bucket["classes"])
+            lines.append(f"    classes = {{ {class_list} }},")
+            lines.append(f"    user_data_dir = {lua_string(bucket['user_data_dir'])},")
+            lines.append("    profiles = {")
+            for profile in bucket["profiles"]:
+                lines.append(
+                    "      { "
+                    f"directory = {lua_string(profile['directory'])}, "
+                    f"tag = {lua_string(profile['tag'])} "
+                    "},"
+                )
+            lines.append("    },")
+            lines.append("  },")
+        lines += [
+            "}",
+            "",
+            "hl.on(\"window.open_early\", function(w)",
+            "  if not w or not w.pid then return end",
+            "  local class_name = w.class or w.initial_class or \"\"",
+            "  for _, browser in ipairs(homing_browsers) do",
+            "    if homing_class_matches(class_name, browser.classes) then",
+            "      local directory = homing_detect_profile(w.pid, browser.user_data_dir, browser.profiles)",
+            "      if directory then",
+            "        for _, profile in ipairs(browser.profiles) do",
+            "          if profile.directory == directory then",
+            "            hl.dispatch(hl.dsp.window.tag({ tag = \"+\" .. profile.tag, window = w }))",
+            "            return",
+            "          end",
+            "        end",
+            "      end",
+            "    end",
+            "  end",
+            "end)",
+            "",
+        ]
+
+        for row in profile_rows:
+            tag = str(row.get("tag") or tag_for_profile(str(row.get("class") or ""), str(row.get("profile_directory") or "Default")))
+            workspace = str(row.get("workspace"))
+            lines.append(
+                "hl.window_rule({\n"
+                f"  name = {lua_string(tag)},\n"
+                f"  match = {{ tag = {lua_string(tag)} }},\n"
+                f"  workspace = {lua_string(workspace)},\n"
+                "})"
+            )
+            lines.append("")
+
+    lines.append("return true")
+    lines.append("")
+    return "\n".join(lines)
+
+
+HYPRLAND_HOOK = '-- Homing plugin: generated app → workspace assignments.\npcall(require, "hypr.homing")\n'
+
+
+def hyprland_has_hook(text: str) -> bool:
+    return "hypr.homing" in text
+
+
+def inject_hyprland_hook(text: str) -> str:
+    if hyprland_has_hook(text):
+        return text
+    hook = "\n" + HYPRLAND_HOOK
+    marker = "-- Added by hyprmoncfg"
+    if marker in text:
+        return text.replace(marker, HYPRLAND_HOOK + "\n" + marker, 1)
+    if text and not text.endswith("\n"):
+        text += "\n"
+    return text + hook
+
+
+def ensure_hyprland_hook(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    original = path.read_text(encoding="utf-8")
+    updated = inject_hyprland_hook(original)
+    if updated == original:
+        return False
+    backup_file(path)
+    atomic_write(path, updated)
+    return True
+
+
+def write_lua(paths: Paths, store: dict[str, Any]) -> None:
+    backup_file(paths.lua)
+    atomic_write(paths.lua, generate_lua(store))
+    ensure_hyprland_hook(paths.hyprland_lua)
+
+
+def hyprctl_json(args: list[str]) -> Any:
+    result = subprocess.run(["hyprctl", *args, "-j"], capture_output=True, text=True)
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+def active_window() -> Window | None:
+    data = hyprctl_json(["activewindow"])
+    if not isinstance(data, dict):
+        return None
+    address = str(data.get("address") or "")
+    class_name = str(data.get("class") or data.get("initialClass") or "")
+    title = str(data.get("title") or "")
+    if not class_name or address in {"", "0x0", "0x00"}:
+        return None
+    workspace = data.get("workspace") or {}
+    workspace_name = str(workspace.get("name") or workspace.get("id") or "")
+    pid = data.get("pid")
+    return Window(
+        address=address,
+        class_name=class_name,
+        initial_class=str(data.get("initialClass") or class_name),
+        title=title,
+        pid=int(pid) if isinstance(pid, int) and pid > 0 else None,
+        workspace=workspace_name,
+    )
+
+
+def list_workspace_names() -> list[str]:
+    names = [str(n) for n in NUMERIC_WORKSPACES]
+    data = hyprctl_json(["workspaces"])
+    if isinstance(data, list):
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or item.get("id") or "")
+            if name and name not in names:
+                names.append(name)
+    return names
+
+
+def menu_select(prompt: str, rows: list[str], width: int = 420) -> str | None:
+    result = subprocess.run(
+        ["omarchy-menu-select", prompt, "--", "--width", str(width)],
+        input="\n".join(rows) + "\n",
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    selection = result.stdout.strip()
+    if not selection:
+        return None
+    if "\t" in selection:
+        return selection.split("\t")[-1]
+    return selection
+
+
+def menu_input(prompt: str, width: int = 420) -> str | None:
+    result = subprocess.run(
+        ["omarchy-menu-input", prompt, "--width", str(width)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    value = result.stdout.strip()
+    return value or None
+
+
+def notify(headline: str, description: str = "", glyph: str = ICON_HOME) -> None:
+    args = ["omarchy-notification-send", "-g", glyph, headline]
+    if description:
+        args.append(description)
+    subprocess.run(args, check=False)
+
+
+def window_label(window: Window, profile: BrowserProfile | None = None) -> str:
+    family = family_for_class(window.class_name)
+    if profile and family:
+        return f"{family.label} ({profile.name})"
+    if family:
+        return family.label
+    return window.class_name
+
+
+def build_class_assignment(window: Window, workspace: str) -> dict[str, Any]:
+    return {
+        "id": assignment_id("class", window.class_name),
+        "kind": "class",
+        "class": window.class_name,
+        "class_regex": class_regex_for(window.class_name),
+        "workspace": workspace,
+        "label": window_label(window),
+    }
+
+
+def build_profile_assignment(window: Window, profile: BrowserProfile, workspace: str) -> dict[str, Any]:
+    return {
+        "id": assignment_id("profile", window.class_name, profile.directory),
+        "kind": "profile",
+        "class": window.class_name,
+        "class_regex": class_regex_for(window.class_name),
+        "profile_directory": profile.directory,
+        "profile_name": profile.name,
+        "user_data_dir": str(profile.user_data_dir),
+        "tag": tag_for_profile(window.class_name, profile.directory),
+        "workspace": workspace,
+        "label": window_label(window, profile),
+    }
+
+
+def validate_workspace(value: str) -> str | None:
+    text = value.strip()
+    if not text:
+        return None
+    if text.isdigit():
+        number = int(text)
+        if number < 1:
+            return None
+        return str(number)
+    if WORKSPACE_RE.match(text):
+        return text
+    return None
+
+
+def choose_workspace(window: Window, current_assignment: dict[str, Any] | None) -> str | None:
+    assigned = str(current_assignment.get("workspace")) if current_assignment else ""
+    rows: list[str] = []
+    for name in list_workspace_names():
+        notes: list[str] = []
+        if name == window.workspace:
+            notes.append("here now")
+        if assigned and name == assigned:
+            notes.append("already homed")
+        icon = ICON_OK if notes else ICON_HOME
+        suffix = f" · {' · '.join(notes)}" if notes else ""
+        rows.append(f"{icon}\tWorkspace {name}{suffix}\t{name}")
+    rows.append(f"{ICON_EDIT}\tCustom workspace…\tcustom")
+    if current_assignment:
+        rows.append(f"{ICON_STOP}\tStop homing this app\tunpin")
+    prompt = f"Home {window_label(window)}"
+    if assigned:
+        prompt += f" · workspace {assigned}"
+    choice = menu_select(prompt, rows)
+    if choice is None:
+        return None
+    if choice == "custom":
+        typed = menu_input("Workspace number or name")
+        if typed is None:
+            return None
+        workspace = validate_workspace(typed)
+        if workspace is None:
+            notify("Homing", f"Not a valid workspace: {typed}", ICON_WARN)
+            return None
+        return workspace
+    return choice
+
+
+def move_window(workspace: str) -> None:
+    script = f'hl.dispatch(hl.dsp.window.move({{ workspace = {lua_string(workspace)} }}))'
+    subprocess.run(["hyprctl", "dispatch", script], capture_output=True, text=True, check=False)
+
+
+def reload_hyprland() -> str:
+    subprocess.run(["hyprctl", "reload"], capture_output=True, text=True, check=False)
+    errors = subprocess.run(["hyprctl", "configerrors"], capture_output=True, text=True, check=False)
+    return (errors.stdout or "").strip()
+
+
+def persist(paths: Paths, store: dict[str, Any]) -> str:
+    save_store(paths.assignments, store)
+    write_lua(paths, store)
+    return reload_hyprland()
+
+
+def cmd_pin(paths: Paths) -> int:
+    window = active_window()
+    if window is None:
+        menu_select("No window focused", [f"{ICON_WARN}\tFocus an app window, then run Homing again\tok"])
+        notify("Homing", "No active window to home", ICON_WARN)
+        return 1
+
+    store = load_store(paths.assignments)
+    profile = detect_browser_profile(window) if family_for_class(window.class_name) else None
+    kind = "class"
+    if profile:
+        choice = menu_select(
+            f"Home {window_label(window, profile)}",
+            [
+                f"{ICON_BROWSER}\tAll {family_for_class(window.class_name).label} windows\tclass",
+                f"{ICON_PROFILE}\tOnly the {profile.name} profile\tprofile",
+            ],
+        )
+        if choice is None:
+            return 0
+        kind = choice
+
+    target_profile = profile if kind == "profile" else None
+    current = find_assignment(store, window, target_profile)
+    workspace = choose_workspace(window, current)
+    if workspace is None:
+        return 0
+    if workspace == "unpin":
+        return cmd_unpin(paths, window=window, profile=target_profile, confirm=False)
+
+    if target_profile:
+        assignment = build_profile_assignment(window, target_profile, workspace)
+    else:
+        assignment = build_class_assignment(window, workspace)
+    upsert_assignment(store, assignment)
+    errors = persist(paths, store)
+    move_window(workspace)
+    label = assignment["label"]
+    if errors:
+        notify("Homing saved, Hyprland reported errors", errors, ICON_WARN)
+    else:
+        notify("Homing", f"{label} will open on workspace {workspace}")
+    return 0
+
+
+def cmd_unpin(paths: Paths, window: Window | None = None, profile: BrowserProfile | None = None, confirm: bool = True) -> int:
+    store = load_store(paths.assignments)
+    window = window or active_window()
+    if window is None:
+        rows = [f"{ICON_STOP}\t{row.get('label') or row.get('id')} · workspace {row.get('workspace')}\t{row.get('id')}" for row in store.get("assignments", [])]
+        if not rows:
+            notify("Homing", "Nothing is homed yet")
+            return 0
+        choice = menu_select("Stop homing", rows)
+        if not choice:
+            return 0
+        remove_assignment(store, choice)
+        errors = persist(paths, store)
+        notify("Homing", "Assignment removed" + (f" ({errors})" if errors else ""), ICON_STOP)
+        return 0
+
+    if profile is None and family_for_class(window.class_name):
+        profile = detect_browser_profile(window)
+    current = find_assignment(store, window, profile)
+    if current is None:
+        notify("Homing", f"{window_label(window, profile)} is not homed")
+        return 0
+    if confirm:
+        choice = menu_select(
+            f"Stop homing {current.get('label') or window.class_name}?",
+            [
+                f"{ICON_STOP}\tRemove workspace {current.get('workspace')} assignment\tyes",
+                f"{ICON_APP}\tKeep it\tno",
+            ],
+        )
+        if choice != "yes":
+            return 0
+    remove_assignment(store, str(current["id"]))
+    errors = persist(paths, store)
+    notify("Homing", f"{current.get('label') or window.class_name} no longer has a home" + (f" ({errors})" if errors else ""), ICON_STOP)
+    return 0
+
+
+def cmd_list(paths: Paths) -> int:
+    store = load_store(paths.assignments)
+    rows = store.get("assignments") or []
+    if not rows:
+        print("No homed apps.")
+        return 0
+    for row in rows:
+        kind = row.get("kind")
+        extra = ""
+        if kind == "profile":
+            extra = f" profile {row.get('profile_name') or row.get('profile_directory')}"
+        print(f"{row.get('workspace'):<8} {row.get('label') or row.get('class')}{extra}  [{row.get('id')}]")
+    return 0
+
+
+def cmd_status(paths: Paths) -> int:
+    window = active_window()
+    if window is None:
+        print("No active window.")
+        return 1
+    store = load_store(paths.assignments)
+    profile = detect_browser_profile(window) if family_for_class(window.class_name) else None
+    current = find_assignment(store, window, profile)
+    print(f"class: {window.class_name}")
+    if window.initial_class != window.class_name:
+        print(f"initialClass: {window.initial_class}")
+    print(f"workspace: {window.workspace}")
+    if profile:
+        print(f"profile: {profile.name} ({profile.directory})")
+    if current:
+        print(f"homed: workspace {current.get('workspace')} ({current.get('id')})")
+    else:
+        print("homed: no")
+    return 0
+
+
+def cmd_reload(paths: Paths) -> int:
+    store = load_store(paths.assignments)
+    write_lua(paths, store)
+    errors = reload_hyprland()
+    if errors:
+        print(errors, file=sys.stderr)
+        return 1
+    print(f"Wrote {paths.lua}")
+    return 0
+
+
+def usage() -> str:
+    return """Usage: homing [command]
+
+Home the focused app so it always opens on the same Hyprland workspace.
+
+Commands:
+  pin       Home the focused window (default)
+  unpin     Remove an assignment
+  list      Print saved assignments
+  status    Show the focused window's identity and assignment
+  reload    Rewrite ~/.config/hypr/homing.lua and reload Hyprland
+"""
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    if args and args[0] in {"-h", "--help", "help"}:
+        print(usage(), end="")
+        return 0
+    command = args[0] if args else "pin"
+    paths = Paths.from_home()
+    if command == "pin":
+        return cmd_pin(paths)
+    if command == "unpin":
+        return cmd_unpin(paths)
+    if command == "list":
+        return cmd_list(paths)
+    if command == "status":
+        return cmd_status(paths)
+    if command == "reload":
+        return cmd_reload(paths)
+    print(usage(), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
