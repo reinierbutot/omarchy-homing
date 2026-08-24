@@ -1,9 +1,13 @@
 #!/usr/bin/python3
 import importlib.machinery
 import importlib.util
+import os
+import stat
 import sys
 import tempfile
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 
@@ -250,6 +254,11 @@ class WorkspaceTests(unittest.TestCase):
         self.assertIsNone(H.validate_workspace("bad workspace"))
 
 
+def _deadline(fn, *args, timeout=2.0, **kwargs):
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(fn, *args, **kwargs).result(timeout=timeout)
+
+
 class PersistTests(unittest.TestCase):
     def test_atomic_write_and_backup(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -260,6 +269,221 @@ class PersistTests(unittest.TestCase):
             data = path.read_text(encoding="utf-8")
             self.assertIn("class:slack", data)
             self.assertFalse(path.with_name(path.name + ".tmp").exists())
+
+
+class SafeIOTests(unittest.TestCase):
+    def test_load_store_ignores_fifo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "assignments.json"
+            os.mkfifo(path)
+            store = _deadline(H.load_store, path)
+            self.assertEqual(store["assignments"], [])
+            self.assertTrue(stat.S_ISFIFO(os.lstat(path).st_mode))
+
+    def test_load_store_does_not_follow_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            victim = root / "victim.json"
+            victim.write_text('{"version": 1, "assignments": [{"id": "class:secret"}]}\n', encoding="utf-8")
+            path = root / "assignments.json"
+            path.symlink_to(victim)
+            store = _deadline(H.load_store, path)
+            self.assertEqual(store["assignments"], [])
+            self.assertEqual(victim.read_text(encoding="utf-8"), '{"version": 1, "assignments": [{"id": "class:secret"}]}\n')
+
+    def test_load_store_rejects_oversized_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "assignments.json"
+            path.write_text("x" * (H.MAX_TEXT_FILE_BYTES + 1), encoding="utf-8")
+            store = H.load_store(path)
+            self.assertEqual(store["assignments"], [])
+
+    def test_atomic_write_ignores_planted_tmp_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "assignments.json"
+            victim = root / "victim"
+            victim.write_text("keep\n", encoding="utf-8")
+            planted = path.with_name(path.name + ".tmp")
+            planted.symlink_to(victim)
+            _deadline(H.atomic_write, path, "safe\n")
+            self.assertEqual(path.read_text(encoding="utf-8"), "safe\n")
+            self.assertEqual(victim.read_text(encoding="utf-8"), "keep\n")
+            self.assertTrue(planted.is_symlink())
+
+    def test_atomic_write_ignores_planted_tmp_fifo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "assignments.json"
+            planted = path.with_name(path.name + ".tmp")
+            os.mkfifo(planted)
+            _deadline(H.atomic_write, path, "safe\n")
+            self.assertEqual(path.read_text(encoding="utf-8"), "safe\n")
+            self.assertTrue(stat.S_ISFIFO(os.lstat(planted).st_mode))
+
+    def test_backup_does_not_write_through_bak_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "assignments.json"
+            path.write_text('{"version": 1, "assignments": []}\n', encoding="utf-8")
+            victim = root / "victim"
+            victim.write_text("keep\n", encoding="utf-8")
+            bak = path.with_suffix(".json.bak")
+            bak.symlink_to(victim)
+            _deadline(H.save_store, path, {"version": 1, "assignments": [{"id": "class:slack"}]})
+            self.assertEqual(victim.read_text(encoding="utf-8"), "keep\n")
+            self.assertFalse(bak.is_symlink())
+            self.assertIn("assignments", bak.read_text(encoding="utf-8"))
+
+    def test_hook_backup_does_not_follow_dangling_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "hyprland.lua"
+            path.write_text('require("hypr.bindings")\n', encoding="utf-8")
+            victim = root / "victim"
+            bak = H.hyprland_hook_backup(path)
+            bak.symlink_to(victim)
+            _deadline(H.backup_hyprland_hook, path)
+            self.assertFalse(victim.exists())
+            self.assertTrue(bak.is_symlink())
+
+    def test_hook_backup_skips_planted_fifo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "hyprland.lua"
+            path.write_text('require("hypr.bindings")\n', encoding="utf-8")
+            bak = H.hyprland_hook_backup(path)
+            os.mkfifo(bak)
+            _deadline(H.backup_hyprland_hook, path)
+            self.assertTrue(stat.S_ISFIFO(os.lstat(bak).st_mode))
+
+    def test_ensure_does_not_follow_hyprland_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "dotfiles" / "hyprland.lua"
+            target.parent.mkdir()
+            original = 'require("hypr.bindings")\n'
+            target.write_text(original, encoding="utf-8")
+            path = root / "hyprland.lua"
+            path.symlink_to(target)
+            self.assertFalse(_deadline(H.ensure_hyprland_hook, path))
+            self.assertEqual(target.read_text(encoding="utf-8"), original)
+            self.assertTrue(path.is_symlink())
+
+    def test_ensure_ignores_hyprland_fifo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "hyprland.lua"
+            os.mkfifo(path)
+            self.assertFalse(_deadline(H.ensure_hyprland_hook, path))
+            self.assertTrue(stat.S_ISFIFO(os.lstat(path).st_mode))
+
+    def test_local_state_does_not_follow_symlink_or_fifo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            victim = root / "real-state"
+            victim.write_text('{"profile": {"info_cache": {"Work": {"name": "Work"}}}}\n', encoding="utf-8")
+            linked = root / "linked"
+            linked.mkdir()
+            (linked / "Local State").symlink_to(victim)
+            names = _deadline(H.profile_directories_from_local_state, linked)
+            self.assertNotIn("Work", names)
+            fifo_dir = root / "fifo"
+            fifo_dir.mkdir()
+            os.mkfifo(fifo_dir / "Local State")
+            names = _deadline(H.profile_directories_from_local_state, fifo_dir)
+            self.assertEqual(names["Default"], "Default")
+
+    def test_uninstall_does_not_unlink_symlink_or_fifo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            hypr = home / ".config" / "hypr"
+            homing_dir = home / ".config" / "omarchy" / "homing"
+            hypr.mkdir(parents=True)
+            homing_dir.mkdir(parents=True)
+            victim = home / "victim.lua"
+            victim.write_text("keep\n", encoding="utf-8")
+            lua = hypr / "homing.lua"
+            lua.symlink_to(victim)
+            fifo = homing_dir / "assignments.json"
+            os.mkfifo(fifo)
+            paths = H.Paths(
+                home=home,
+                assignments=fifo,
+                lua=lua,
+                hyprland_lua=hypr / "hyprland.lua",
+            )
+            changed = _deadline(H.uninstall_files, paths)
+            self.assertTrue(lua.is_symlink())
+            self.assertEqual(victim.read_text(encoding="utf-8"), "keep\n")
+            self.assertTrue(stat.S_ISFIFO(os.lstat(fifo).st_mode))
+            self.assertFalse(any(str(lua) == item or str(fifo) == item for item in changed))
+
+    def test_exclusive_write_does_not_follow_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            victim = root / "victim"
+            victim.write_text("keep\n", encoding="utf-8")
+            path = root / "hyprland.lua.homing.bak"
+            path.symlink_to(victim)
+            with self.assertRaises(OSError):
+                _deadline(H.exclusive_write, path, "overwrite\n")
+            self.assertEqual(victim.read_text(encoding="utf-8"), "keep\n")
+            self.assertTrue(path.is_symlink())
+
+    def test_maybe_install_skips_symlink_hyprland(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            hypr = home / ".config" / "hypr"
+            hypr.mkdir(parents=True)
+            target = hypr / "real.lua"
+            target.write_text('require("hypr.bindings")\n', encoding="utf-8")
+            hyprland = hypr / "hyprland.lua"
+            hyprland.symlink_to(target)
+            paths = H.Paths(
+                home=home,
+                assignments=home / ".config" / "omarchy" / "homing" / "assignments.json",
+                lua=hypr / "homing.lua",
+                hyprland_lua=hyprland,
+            )
+            store = _deadline(H.maybe_install_hyprland_hook, paths, H.empty_store())
+            self.assertEqual(store.get("hyprlandHook"), "unsafe-config")
+            self.assertEqual(target.read_text(encoding="utf-8"), 'require("hypr.bindings")\n')
+            self.assertTrue(hyprland.is_symlink())
+
+
+class SubprocessTests(unittest.TestCase):
+    def test_run_limited_captures_output(self):
+        result = H.run_limited([sys.executable, "-c", "print('hello')"], timeout=5)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout.strip(), "hello")
+
+    def test_run_limited_passes_stdin(self):
+        result = H.run_limited(
+            [sys.executable, "-c", "import sys; print(sys.stdin.read(), end='')"],
+            timeout=5,
+            input_text="abc\n",
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result.stdout, "abc\n")
+
+    def test_run_limited_times_out(self):
+        started = time.monotonic()
+        result = H.run_limited(["sleep", "30"], timeout=0.2)
+        self.assertIsNone(result)
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_run_limited_caps_output(self):
+        started = time.monotonic()
+        result = H.run_limited(
+            [sys.executable, "-c", "import sys; sys.stdout.write('x' * 5_000_000); sys.stdout.flush()"],
+            timeout=5,
+            max_output=64_000,
+        )
+        self.assertIsNone(result)
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_run_limited_missing_binary(self):
+        self.assertIsNone(H.run_limited(["homing-no-such-command"], timeout=1))
 
 
 if __name__ == "__main__":

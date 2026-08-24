@@ -12,12 +12,16 @@ rules run.
 
 from __future__ import annotations
 
+import errno
+import fcntl
 import json
 import os
 import re
-import shutil
+import signal
+import stat
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -36,6 +40,16 @@ ICON_EDIT = ""
 ICON_STOP = ""
 ICON_WARN = ""
 ICON_OK = ""
+
+MAX_TEXT_FILE_BYTES = 2 * 1024 * 1024
+MAX_LOCAL_STATE_BYTES = 8 * 1024 * 1024
+MAX_SUBPROCESS_OUTPUT = 1 * 1024 * 1024
+HYPRCTL_TIMEOUT = 8.0
+HYPRCTL_RELOAD_TIMEOUT = 15.0
+MENU_TIMEOUT = 600.0
+NOTIFY_TIMEOUT = 5.0
+READ_FLAGS = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+EXCL_WRITE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
 
 
 @dataclass(frozen=True)
@@ -247,14 +261,250 @@ def fd_paths(pid: int) -> list[str]:
     return paths
 
 
+def _lstat(path: Path) -> os.stat_result | None:
+    try:
+        return os.lstat(path)
+    except OSError:
+        return None
+
+
+def _close_fd(fd: int) -> None:
+    if fd >= 0:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _drop_nonblock(fd: int) -> None:
+    try:
+        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
+    except OSError:
+        pass
+
+
+def _fsync_dir(directory: Path) -> None:
+    try:
+        dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError:
+        pass
+    finally:
+        _close_fd(dir_fd)
+
+
+def _open_regular(path: Path, flags: int) -> tuple[int, os.stat_result]:
+    fd = os.open(path, flags)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError(errno.EINVAL, f"not a regular file: {path}")
+        _drop_nonblock(fd)
+        opened = fd
+        fd = -1
+        return opened, info
+    finally:
+        _close_fd(fd)
+
+
+def read_regular_file(path: Path, *, max_bytes: int) -> str | None:
+    """Read a regular file without following the last path component or blocking on FIFOs."""
+    try:
+        fd, info = _open_regular(path, READ_FLAGS)
+    except OSError:
+        return None
+    try:
+        if info.st_size > max_bytes:
+            return None
+        chunks: list[bytes] = []
+        remaining = max_bytes + 1
+        while remaining > 0:
+            block = os.read(fd, remaining)
+            if not block:
+                break
+            chunks.append(block)
+            remaining -= len(block)
+        data = b"".join(chunks)
+        if len(data) > max_bytes:
+            return None
+        return data.decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    finally:
+        _close_fd(fd)
+
+
+def _replace_mode(path: Path) -> int:
+    info = _lstat(path)
+    if info is not None and stat.S_ISREG(info.st_mode):
+        return stat.S_IMODE(info.st_mode)
+    return 0o644
+
+
+def _exclusive_tmp(directory: Path, name: str) -> tuple[int, str]:
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+    last_error: OSError | None = None
+    for _ in range(64):
+        tmp_path = directory / f".{name}.{os.urandom(8).hex()}.tmp"
+        try:
+            return os.open(tmp_path, flags, 0o600), str(tmp_path)
+        except OSError as exc:
+            last_error = exc
+            if exc.errno != errno.EEXIST:
+                raise
+    raise OSError(errno.EEXIST, "could not create temporary file") from last_error
+
+
+def exclusive_write(path: Path, text: str) -> None:
+    data = text.encode("utf-8")
+    fd = os.open(path, EXCL_WRITE_FLAGS, 0o644)
+    try:
+        written = 0
+        while written < len(data):
+            written += os.write(fd, data[written:])
+        os.fsync(fd)
+    except Exception:
+        _close_fd(fd)
+        fd = -1
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+    _close_fd(fd)
+
+
+def unlink_regular(path: Path) -> bool:
+    info = _lstat(path)
+    if info is None or not stat.S_ISREG(info.st_mode):
+        return False
+    try:
+        os.unlink(path)
+    except OSError:
+        return False
+    return True
+
+
+def rmdir_if_empty(path: Path) -> bool:
+    info = _lstat(path)
+    if info is None or not stat.S_ISDIR(info.st_mode):
+        return False
+    try:
+        os.rmdir(path)
+    except OSError:
+        return False
+    return True
+
+
+def _kill_process(proc: subprocess.Popen[bytes]) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+def run_limited(
+    args: list[str],
+    *,
+    timeout: float,
+    max_output: int = MAX_SUBPROCESS_OUTPUT,
+    input_text: str | None = None,
+) -> subprocess.CompletedProcess[str] | None:
+    """Run a subprocess with a deadline and a hard cap on captured output."""
+    try:
+        proc = subprocess.Popen(
+            args,
+            stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+    except OSError:
+        return None
+    assert proc.stdout is not None and proc.stderr is not None
+    chunks = {"out": bytearray(), "err": bytearray()}
+    overflow = threading.Event()
+
+    def pump(stream: Any, key: str) -> None:
+        try:
+            while True:
+                block = stream.read(65536)
+                if not block:
+                    return
+                buf = chunks[key]
+                room = max_output - len(buf)
+                if room <= 0 or len(block) > room:
+                    if room > 0:
+                        buf.extend(block[:room])
+                    overflow.set()
+                    _kill_process(proc)
+                    return
+                buf.extend(block)
+        except (OSError, ValueError):
+            return
+
+    readers = [
+        threading.Thread(target=pump, args=(proc.stdout, "out"), daemon=True),
+        threading.Thread(target=pump, args=(proc.stderr, "err"), daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
+    try:
+        if input_text is not None and proc.stdin is not None:
+            try:
+                proc.stdin.write(input_text.encode("utf-8"))
+            except OSError:
+                pass
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_process(proc)
+            try:
+                proc.wait(timeout=1)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+            return None
+        if overflow.is_set() or proc.returncode is None:
+            if proc.returncode is None:
+                _kill_process(proc)
+            return None
+        return subprocess.CompletedProcess(
+            args,
+            proc.returncode,
+            bytes(chunks["out"]).decode("utf-8", "replace"),
+            bytes(chunks["err"]).decode("utf-8", "replace"),
+        )
+    finally:
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+        for reader in readers:
+            reader.join(timeout=1)
+
+
 def profile_directories_from_local_state(user_data_dir: Path) -> dict[str, str]:
     names = {"Default": "Default", "Guest Profile": "Guest"}
     local_state = user_data_dir / "Local State"
-    if not local_state.is_file():
+    raw = read_regular_file(local_state, max_bytes=MAX_LOCAL_STATE_BYTES)
+    if raw is None:
         return names
     try:
-        data = json.loads(local_state.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        data = json.loads(raw)
+    except json.JSONDecodeError:
         return names
     cache = data.get("profile", {}).get("info_cache", {})
     if isinstance(cache, dict):
@@ -330,11 +580,12 @@ def empty_store() -> dict[str, Any]:
 
 
 def load_store(path: Path) -> dict[str, Any]:
-    if not path.is_file():
+    raw = read_regular_file(path, max_bytes=MAX_TEXT_FILE_BYTES)
+    if raw is None:
         return empty_store()
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        data = json.loads(raw)
+    except json.JSONDecodeError:
         return empty_store()
     if not isinstance(data, dict):
         return empty_store()
@@ -376,8 +627,10 @@ def find_assignment(store: dict[str, Any], window: Window, profile: BrowserProfi
 
 
 def backup_file(path: Path) -> None:
-    if path.is_file():
-        shutil.copy2(path, path.with_suffix(path.suffix + ".bak"))
+    text = read_regular_file(path, max_bytes=MAX_TEXT_FILE_BYTES)
+    if text is None:
+        return
+    atomic_write(path.with_suffix(path.suffix + ".bak"), text)
 
 
 def hyprland_hook_backup(path: Path) -> Path:
@@ -386,15 +639,42 @@ def hyprland_hook_backup(path: Path) -> Path:
 
 def backup_hyprland_hook(path: Path) -> None:
     bak = hyprland_hook_backup(path)
-    if path.is_file() and not bak.exists():
-        shutil.copy2(path, bak)
+    if _lstat(bak) is not None:
+        return
+    text = read_regular_file(path, max_bytes=MAX_TEXT_FILE_BYTES)
+    if text is None:
+        return
+    try:
+        exclusive_write(bak, text)
+    except OSError:
+        return
 
 
 def atomic_write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    tmp.replace(path)
+    data = text.encode("utf-8")
+    mode = _replace_mode(path)
+    fd = -1
+    tmp_name = ""
+    try:
+        fd, tmp_name = _exclusive_tmp(path.parent, path.name)
+        os.fchmod(fd, mode)
+        written = 0
+        while written < len(data):
+            written += os.write(fd, data[written:])
+        os.fsync(fd)
+        os.close(fd)
+        fd = -1
+        os.replace(tmp_name, path)
+        tmp_name = ""
+        _fsync_dir(path.parent)
+    finally:
+        _close_fd(fd)
+        if tmp_name:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
 
 
 def save_store(path: Path, store: dict[str, Any]) -> None:
@@ -615,9 +895,9 @@ def remove_hyprland_hook(text: str) -> str:
 
 
 def ensure_hyprland_hook(path: Path) -> bool:
-    if not path.is_file():
+    original = read_regular_file(path, max_bytes=MAX_TEXT_FILE_BYTES)
+    if original is None:
         return False
-    original = path.read_text(encoding="utf-8")
     updated = inject_hyprland_hook(original)
     if updated == original:
         return False
@@ -633,15 +913,23 @@ def write_lua(paths: Paths, store: dict[str, Any]) -> None:
 
 def maybe_install_hyprland_hook(paths: Paths, store: dict[str, Any], *, force: bool = False) -> dict[str, Any]:
     """Ask before touching hyprland.lua. Never writes that file unless the user picks Yes."""
-    if not paths.hyprland_lua.is_file():
-        store["hyprlandHook"] = "missing-config"
-        notify(
-            "Homing",
-            f"No {paths.hyprland_lua} to hook. Add {HYPRLAND_HOOK_CALL} yourself if you use Hyprland Lua.",
-            ICON_WARN,
-        )
+    current = read_regular_file(paths.hyprland_lua, max_bytes=MAX_TEXT_FILE_BYTES)
+    if current is None:
+        if _lstat(paths.hyprland_lua) is None:
+            store["hyprlandHook"] = "missing-config"
+            notify(
+                "Homing",
+                f"No {paths.hyprland_lua} to hook. Add {HYPRLAND_HOOK_CALL} yourself if you use Hyprland Lua.",
+                ICON_WARN,
+            )
+        else:
+            store["hyprlandHook"] = "unsafe-config"
+            notify(
+                "Homing",
+                f"{paths.hyprland_lua} is not a regular file; add {HYPRLAND_HOOK_CALL} yourself.",
+                ICON_WARN,
+            )
         return store
-    current = paths.hyprland_lua.read_text(encoding="utf-8")
     if hyprland_has_hook(current):
         store["hyprlandHook"] = "installed"
         return store
@@ -679,27 +967,25 @@ def generated_paths(paths: Paths) -> list[Path]:
 
 def uninstall_files(paths: Paths) -> list[str]:
     changed: list[str] = []
-    if paths.hyprland_lua.is_file():
-        original = paths.hyprland_lua.read_text(encoding="utf-8")
+    original = read_regular_file(paths.hyprland_lua, max_bytes=MAX_TEXT_FILE_BYTES)
+    if original is not None:
         updated = remove_hyprland_hook(original)
         if updated != original:
             backup_hyprland_hook(paths.hyprland_lua)
             atomic_write(paths.hyprland_lua, updated)
             changed.append(str(paths.hyprland_lua))
     for path in generated_paths(paths):
-        if path.is_file():
-            path.unlink()
+        if unlink_regular(path):
             changed.append(str(path))
     parent = paths.assignments.parent
-    if parent.is_dir() and not any(parent.iterdir()):
-        parent.rmdir()
+    if rmdir_if_empty(parent):
         changed.append(str(parent))
     return changed
 
 
 def hyprctl_json(args: list[str]) -> Any:
-    result = subprocess.run(["hyprctl", *args, "-j"], capture_output=True, text=True)
-    if result.returncode != 0 or not result.stdout.strip():
+    result = run_limited(["hyprctl", *args, "-j"], timeout=HYPRCTL_TIMEOUT)
+    if result is None or result.returncode != 0 or not result.stdout.strip():
         return None
     try:
         return json.loads(result.stdout)
@@ -743,13 +1029,12 @@ def list_workspace_names() -> list[str]:
 
 
 def menu_select(prompt: str, rows: list[str], width: int = 420) -> str | None:
-    result = subprocess.run(
+    result = run_limited(
         ["omarchy-menu-select", prompt, "--", "--width", str(width)],
-        input="\n".join(rows) + "\n",
-        capture_output=True,
-        text=True,
+        timeout=MENU_TIMEOUT,
+        input_text="\n".join(rows) + "\n",
     )
-    if result.returncode != 0:
+    if result is None or result.returncode != 0:
         return None
     selection = result.stdout.strip()
     if not selection:
@@ -760,12 +1045,11 @@ def menu_select(prompt: str, rows: list[str], width: int = 420) -> str | None:
 
 
 def menu_input(prompt: str, width: int = 420) -> str | None:
-    result = subprocess.run(
+    result = run_limited(
         ["omarchy-menu-input", prompt, "--width", str(width)],
-        capture_output=True,
-        text=True,
+        timeout=MENU_TIMEOUT,
     )
-    if result.returncode != 0:
+    if result is None or result.returncode != 0:
         return None
     value = result.stdout.strip()
     return value or None
@@ -775,7 +1059,7 @@ def notify(headline: str, description: str = "", glyph: str = ICON_HOME) -> None
     args = ["omarchy-notification-send", "-g", glyph, headline]
     if description:
         args.append(description)
-    subprocess.run(args, check=False)
+    run_limited(args, timeout=NOTIFY_TIMEOUT)
 
 
 def window_label(window: Window, profile: BrowserProfile | None = None) -> str:
@@ -862,12 +1146,14 @@ def choose_workspace(window: Window, current_assignment: dict[str, Any] | None) 
 
 def move_window(workspace: str) -> None:
     script = f'hl.dispatch(hl.dsp.window.move({{ workspace = {lua_string(workspace)} }}))'
-    subprocess.run(["hyprctl", "dispatch", script], capture_output=True, text=True, check=False)
+    run_limited(["hyprctl", "dispatch", script], timeout=HYPRCTL_TIMEOUT)
 
 
 def reload_hyprland() -> str:
-    subprocess.run(["hyprctl", "reload"], capture_output=True, text=True, check=False)
-    errors = subprocess.run(["hyprctl", "configerrors"], capture_output=True, text=True, check=False)
+    run_limited(["hyprctl", "reload"], timeout=HYPRCTL_RELOAD_TIMEOUT)
+    errors = run_limited(["hyprctl", "configerrors"], timeout=HYPRCTL_TIMEOUT)
+    if errors is None:
+        return ""
     return (errors.stdout or "").strip()
 
 
@@ -1010,7 +1296,8 @@ def cmd_reload(paths: Paths) -> int:
 
 def cmd_hook(paths: Paths) -> int:
     store = load_store(paths.assignments)
-    if paths.hyprland_lua.is_file() and hyprland_has_hook(paths.hyprland_lua.read_text(encoding="utf-8")):
+    current = read_regular_file(paths.hyprland_lua, max_bytes=MAX_TEXT_FILE_BYTES)
+    if current is not None and hyprland_has_hook(current):
         store["hyprlandHook"] = "installed"
         save_store(paths.assignments, store)
         notify("Homing", "Hyprland already loads homing.lua")
