@@ -812,7 +812,8 @@ def generate_lua(store: dict[str, Any]) -> str:
                 lines.append(
                     "      { "
                     f"directory = {lua_string(profile['directory'])}, "
-                    f"tag = {lua_string(profile['tag'])} "
+                    f"tag = {lua_string(profile['tag'])}, "
+                    f"workspace = {lua_string(profile['workspace'])} "
                     "},"
                 )
             lines.append("    },")
@@ -820,16 +821,19 @@ def generate_lua(store: dict[str, Any]) -> str:
         lines += [
             "}",
             "",
-            "hl.on(\"window.open_early\", function(w)",
+            'hl.on("window.open_early", function(w)',
             "  if not w or not w.pid then return end",
-            "  local class_name = w.class or w.initial_class or \"\"",
+            '  local class_name = w.class or w.initial_class or ""',
             "  for _, browser in ipairs(homing_browsers) do",
             "    if homing_class_matches(class_name, browser.classes) then",
             "      local directory = homing_detect_profile(w.pid, browser.user_data_dir, browser.profiles)",
             "      if directory then",
             "        for _, profile in ipairs(browser.profiles) do",
             "          if profile.directory == directory then",
-            "            hl.dispatch(hl.dsp.window.tag({ tag = \"+\" .. profile.tag, window = w }))",
+            '            hl.dispatch(hl.dsp.window.tag({ tag = "+" .. profile.tag, window = w }))',
+            "            if profile.workspace then",
+            "              hl.dispatch(hl.dsp.window.move({ workspace = profile.workspace, window = w }))",
+            "            end",
             "            return",
             "          end",
             "        end",

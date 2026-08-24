@@ -123,6 +123,7 @@ class LuaTests(unittest.TestCase):
         self.assertIn('tag = "homing-chromium-profile-1"', lua)
         self.assertIn('match = { tag = "homing-chromium-profile-1" }', lua)
         self.assertIn('workspace = "5"', lua)
+        self.assertIn("hl.dsp.window.move", lua)
         self.assertIn("/home/reinier/.config/chromium", lua)
 
     def test_lua_string_escapes(self):
