@@ -683,16 +683,17 @@ def save_store(path: Path, store: dict[str, Any]) -> None:
 
 
 LUA_PROFILE_RUNTIME = r'''
-local function homing_read(path)
+local function homing_read(path, max_bytes)
+  local max_len = max_bytes or 2097152
   local file = io.open(path, "r")
   if not file then return nil end
-  local data = file:read("*a")
+  local data = file:read(max_len)
   file:close()
   return data
 end
 
 local function homing_ppid(pid)
-  local status = homing_read("/proc/" .. tostring(pid) .. "/status")
+  local status = homing_read("/proc/" .. tostring(pid) .. "/status", 65536)
   if not status then return nil end
   return tonumber(status:match("PPid:%s*(%d+)"))
 end
@@ -719,11 +720,11 @@ local function homing_detect_profile(pid, user_data_dir, profiles)
   local current = pid
   for _ = 1, 8 do
     if not current or current <= 1 then break end
-    local cmdline = homing_read("/proc/" .. tostring(current) .. "/cmdline") or ""
+    local cmdline = homing_read("/proc/" .. tostring(current) .. "/cmdline", 65536) or ""
     cmdline = cmdline:gsub("%z", "\n")
     local flagged = homing_profile_from_cmdline(cmdline)
     if flagged then return flagged end
-    local maps = homing_read("/proc/" .. tostring(current) .. "/maps") or ""
+    local maps = homing_read("/proc/" .. tostring(current) .. "/maps", 2097152) or ""
     local best, best_len = nil, -1
     for _, profile in ipairs(profiles) do
       local needle = user_data_dir .. "/" .. profile.directory .. "/"

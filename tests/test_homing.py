@@ -125,6 +125,11 @@ class LuaTests(unittest.TestCase):
         self.assertIn('workspace = "5"', lua)
         self.assertIn("hl.dsp.window.move", lua)
         self.assertIn("/home/reinier/.config/chromium", lua)
+        self.assertNotIn('*a', lua)
+        self.assertIn("file:read(max_len)", lua)
+        self.assertIn('homing_read("/proc/" .. tostring(pid) .. "/status", 65536)', lua)
+        self.assertIn('homing_read("/proc/" .. tostring(current) .. "/cmdline", 65536)', lua)
+        self.assertIn('homing_read("/proc/" .. tostring(current) .. "/maps", 2097152)', lua)
 
     def test_lua_string_escapes(self):
         self.assertEqual(H.lua_string('a"b\\c'), r'"a\"b\\c"')
