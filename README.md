@@ -35,7 +35,7 @@ You can home:
 
 ## Homing Chromium Profile (Shortcuts)
 
-First, look up the 'Profile Path' on the `chrome://version` page, of your Chromium profile. For me that is `/home/reinier/.config/chromium/Default` for my Work profile and `/home/reinier/.config/chromium/Profile 1` for my private profile. Then use the directory name (`Default` and `Profile 1` in my case) and use those in each .desktop file to distinguish it from the other Chromium shortcut.
+First, look up the 'Profile Path' on the `chrome://version` page of your Chromium profile. That is typically `~/.config/chromium/Default` for the first profile and `~/.config/chromium/Profile 1` for a second one. Use the directory name (`Default` and `Profile 1` in this example) in each `.desktop` file so the shortcuts stay distinct.
 
 My Work Shortcut file:
 ```
@@ -73,7 +73,7 @@ Profile rules tag the window on `window.open_early` (before window rules run) an
 
 | Path | Role |
 |---|---|
-| `~/.config/omarchy/homing/assignments.json` | Source of truth (created when you home an app) |
+| `~/.config/omarchy/homing/assignments.json` | Source of truth (created when you home an app). Browser profile dirs are stored as `$XDG_CONFIG_HOME/...` or `~/...`, then resolved for the current user when Homing writes `homing.lua`. |
 | `~/.config/hypr/homing.lua` | Generated Hyprland rules (do not edit) |
 | `*.bak` next to those two files | Previous copy of Homing's own files |
 | `~/.config/hypr/hyprland.lua` | Touched only if you agree to add `pcall(require, "hypr.homing")` |

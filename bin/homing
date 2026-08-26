@@ -31,6 +31,9 @@ ASSIGNMENTS_VERSION = 1
 NUMERIC_WORKSPACES = list(range(1, 11))
 RE2_SPECIAL = set(r"\.^$|()[]{}*+?")
 WORKSPACE_RE = re.compile(r"^(?:\d+|special:[A-Za-z0-9_-]+|name:[A-Za-z0-9_-]+|[A-Za-z0-9_-]+)$")
+ABS_CONFIG_RE = re.compile(r"^/(?:home|Users|var/home)/[^/]+/\.config/(.+)$")
+ABS_HOME_RE = re.compile(r"^/(?:home|Users|var/home)/[^/]+/(.+)$")
+XDG_CONFIG_PREFIX = "$XDG_CONFIG_HOME"
 
 ICON_HOME = "󰋜"
 ICON_APP = ""
@@ -70,6 +73,17 @@ class Paths:
             hyprland_lua=config / "hypr" / "hyprland.lua",
         )
 
+    @property
+    def config(self) -> Path:
+        return self.assignments.parent.parent.parent
+
+
+def default_config_home(home: Path | None = None) -> Path:
+    env = os.environ.get("XDG_CONFIG_HOME")
+    if env:
+        return Path(env)
+    return (Path(home) if home is not None else Path.home()) / ".config"
+
 
 @dataclass(frozen=True)
 class BrowserFamily:
@@ -78,7 +92,11 @@ class BrowserFamily:
     class_re: re.Pattern[str]
     class_regex: str
     classes: tuple[str, ...]
-    user_data_dir: Path
+    config_subdir: str
+
+    @property
+    def user_data_dir(self) -> Path:
+        return default_config_home() / self.config_subdir
 
 
 BROWSER_FAMILIES = (
@@ -88,7 +106,7 @@ BROWSER_FAMILIES = (
         class_re=re.compile(r"^(chromium|chromium-browser)$", re.I),
         class_regex=r"^([Cc]hromium(-browser)?)$",
         classes=("chromium", "Chromium", "chromium-browser", "Chromium-browser"),
-        user_data_dir=Path.home() / ".config" / "chromium",
+        config_subdir="chromium",
     ),
     BrowserFamily(
         id="chrome",
@@ -96,7 +114,7 @@ BROWSER_FAMILIES = (
         class_re=re.compile(r"^(google-chrome(-stable)?)$", re.I),
         class_regex=r"^([Gg]oogle-chrome(-stable)?)$",
         classes=("google-chrome", "Google-chrome", "google-chrome-stable"),
-        user_data_dir=Path.home() / ".config" / "google-chrome",
+        config_subdir="google-chrome",
     ),
     BrowserFamily(
         id="brave",
@@ -104,7 +122,7 @@ BROWSER_FAMILIES = (
         class_re=re.compile(r"^(brave-browser|brave)$", re.I),
         class_regex=r"^([Bb]rave(-browser)?)$",
         classes=("brave-browser", "Brave-browser", "brave", "Brave"),
-        user_data_dir=Path.home() / ".config" / "BraveSoftware" / "Brave-Browser",
+        config_subdir="BraveSoftware/Brave-Browser",
     ),
     BrowserFamily(
         id="edge",
@@ -112,7 +130,7 @@ BROWSER_FAMILIES = (
         class_re=re.compile(r"^(microsoft-edge(-stable)?)$", re.I),
         class_regex=r"^([Mm]icrosoft-edge(-stable)?)$",
         classes=("microsoft-edge", "Microsoft-edge", "microsoft-edge-stable"),
-        user_data_dir=Path.home() / ".config" / "microsoft-edge",
+        config_subdir="microsoft-edge",
     ),
     BrowserFamily(
         id="vivaldi",
@@ -120,7 +138,7 @@ BROWSER_FAMILIES = (
         class_re=re.compile(r"^vivaldi-stable$", re.I),
         class_regex=r"^([Vv]ivaldi-stable)$",
         classes=("vivaldi-stable", "Vivaldi-stable"),
-        user_data_dir=Path.home() / ".config" / "vivaldi",
+        config_subdir="vivaldi",
     ),
     BrowserFamily(
         id="helium",
@@ -128,7 +146,7 @@ BROWSER_FAMILIES = (
         class_re=re.compile(r"^helium$", re.I),
         class_regex=r"^([Hh]elium)$",
         classes=("helium", "Helium"),
-        user_data_dir=Path.home() / ".config" / "net.imput.helium",
+        config_subdir="net.imput.helium",
     ),
 )
 
@@ -170,6 +188,107 @@ def class_regex_for(class_name: str) -> str:
 
 def lua_string(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def portable_user_data_dir(
+    value: str | Path,
+    *,
+    home: Path | None = None,
+    config: Path | None = None,
+) -> str:
+    text = str(value).strip().replace("\\", "/")
+    if not text:
+        return text
+    if text == XDG_CONFIG_PREFIX or text.startswith(XDG_CONFIG_PREFIX + "/"):
+        rest = text[len(XDG_CONFIG_PREFIX) :].lstrip("/")
+        return f"{XDG_CONFIG_PREFIX}/{rest}" if rest else XDG_CONFIG_PREFIX
+    if text == "~" or text.startswith("~/"):
+        return text.rstrip("/") or "~"
+
+    home = Path(home) if home is not None else Path.home()
+    config = Path(config) if config is not None else default_config_home(home)
+    path = Path(text.rstrip("/")).expanduser()
+
+    if _is_relative_to(path, config):
+        rel = path.relative_to(config).as_posix()
+        return f"{XDG_CONFIG_PREFIX}/{rel}" if rel != "." else XDG_CONFIG_PREFIX
+    if _is_relative_to(path, home):
+        rel = path.relative_to(home).as_posix()
+        return f"~/{rel}" if rel != "." else "~"
+
+    posix = path.as_posix()
+    match = ABS_CONFIG_RE.match(posix)
+    if match:
+        return f"{XDG_CONFIG_PREFIX}/{match.group(1)}"
+    match = ABS_HOME_RE.match(posix)
+    if match:
+        return f"~/{match.group(1)}"
+    return str(path)
+
+
+def resolve_user_data_dir(
+    value: str | Path,
+    *,
+    home: Path | None = None,
+    config: Path | None = None,
+) -> Path:
+    home = Path(home) if home is not None else Path.home()
+    config = Path(config) if config is not None else default_config_home(home)
+    portable = portable_user_data_dir(value, home=home, config=config)
+    if portable == XDG_CONFIG_PREFIX:
+        return config
+    if portable.startswith(XDG_CONFIG_PREFIX + "/"):
+        return config / portable[len(XDG_CONFIG_PREFIX) + 1 :]
+    if portable == "~":
+        return home
+    if portable.startswith("~/"):
+        return home / portable[2:]
+    return Path(portable).expanduser()
+
+
+def lua_user_data_dir_expr(
+    stored: str,
+    *,
+    home: Path | None = None,
+    config: Path | None = None,
+) -> str:
+    portable = portable_user_data_dir(stored, home=home, config=config)
+    if portable == XDG_CONFIG_PREFIX:
+        return "homing_config_home"
+    if portable.startswith(XDG_CONFIG_PREFIX + "/"):
+        rest = portable[len(XDG_CONFIG_PREFIX) :]
+        return f"homing_config_home .. {lua_string(rest)}"
+    if portable == "~":
+        return "homing_home"
+    if portable.startswith("~/"):
+        return f"homing_home .. {lua_string(portable[1:])}"
+    return lua_string(portable)
+
+
+def migrate_assignment_paths(
+    store: dict[str, Any],
+    *,
+    home: Path | None = None,
+    config: Path | None = None,
+) -> dict[str, Any]:
+    for row in store.get("assignments") or []:
+        if not isinstance(row, dict) or row.get("kind") != "profile":
+            continue
+        stored = row.get("user_data_dir")
+        if not stored:
+            family = family_for_class(str(row.get("class") or ""))
+            stored = str(family.user_data_dir) if family else ""
+        if stored:
+            row["user_data_dir"] = portable_user_data_dir(stored, home=home, config=config)
+    return store
 
 
 def assignment_id(kind: str, class_name: str, profile_directory: str | None = None) -> str:
@@ -528,11 +647,16 @@ def detect_user_data_dir(pid: int | None, family: BrowserFamily | None) -> Path 
             maps = proc_text(candidate, "maps")
             fds = "\n".join(fd_paths(candidate))
             blob = maps + "\n" + fds
-            if family and str(family.user_data_dir) in blob:
-                return family.user_data_dir
-            match = re.search(r"(/home/[^/\s]+/\.config/(?:chromium|google-chrome|BraveSoftware/Brave-Browser|microsoft-edge|vivaldi|net\.imput\.helium))", blob)
-            if match:
-                return Path(match.group(1))
+            if family:
+                default_dir = str(family.user_data_dir)
+                if default_dir in blob:
+                    return family.user_data_dir
+                match = re.search(
+                    rf"((?:/[^/\s]+)+/\.config/{re.escape(family.config_subdir)})(?:/|\s|$)",
+                    blob,
+                )
+                if match:
+                    return Path(match.group(1))
     if family and family.user_data_dir.is_dir():
         return family.user_data_dir
     return None
@@ -593,7 +717,7 @@ def load_store(path: Path) -> dict[str, Any]:
     if not isinstance(assignments, list):
         data["assignments"] = []
     data["version"] = ASSIGNMENTS_VERSION
-    return data
+    return migrate_assignment_paths(data)
 
 
 def upsert_assignment(store: dict[str, Any], assignment: dict[str, Any]) -> dict[str, Any]:
@@ -678,6 +802,7 @@ def atomic_write(path: Path, text: str) -> None:
 
 
 def save_store(path: Path, store: dict[str, Any]) -> None:
+    migrate_assignment_paths(store)
     backup_file(path)
     atomic_write(path, json.dumps(store, indent=2, sort_keys=False) + "\n")
 
@@ -748,8 +873,21 @@ local function homing_class_matches(class_name, classes)
 end
 '''
 
+LUA_PATH_RUNTIME = r'''
+local homing_home = os.getenv("HOME") or ""
+local homing_config_home = os.getenv("XDG_CONFIG_HOME")
+if not homing_config_home or homing_config_home == "" then
+  homing_config_home = homing_home .. "/.config"
+end
+'''
 
-def generate_lua(store: dict[str, Any]) -> str:
+
+def generate_lua(
+    store: dict[str, Any],
+    *,
+    home: Path | None = None,
+    config: Path | None = None,
+) -> str:
     assignments = store.get("assignments") or []
     lines = [
         "-- Homing autogenerated rules. Do not edit.",
@@ -783,11 +921,12 @@ def generate_lua(store: dict[str, Any]) -> str:
             class_name = str(row.get("class") or "")
             family = family_for_class(class_name)
             family_id = family.id if family else slug(class_name)
+            stored = row.get("user_data_dir") or (str(family.user_data_dir) if family else "")
             bucket = families.setdefault(
                 family_id,
                 {
                     "classes": list(family.classes) if family else [class_name],
-                    "user_data_dir": str(row.get("user_data_dir") or (family.user_data_dir if family else "")),
+                    "user_data_dir": portable_user_data_dir(stored, home=home, config=config),
                     "profiles": [],
                 },
             )
@@ -801,13 +940,15 @@ def generate_lua(store: dict[str, Any]) -> str:
 
         lines.append(LUA_PROFILE_RUNTIME.rstrip())
         lines.append("")
+        lines.append(LUA_PATH_RUNTIME.rstrip())
+        lines.append("")
         lines.append("local homing_browsers = {")
 
         for family_id, bucket in families.items():
             lines.append("  {")
             class_list = ", ".join(lua_string(item) for item in bucket["classes"])
             lines.append(f"    classes = {{ {class_list} }},")
-            lines.append(f"    user_data_dir = {lua_string(bucket['user_data_dir'])},")
+            lines.append(f"    user_data_dir = {lua_user_data_dir_expr(bucket['user_data_dir'], home=home, config=config)},")
             lines.append("    profiles = {")
             for profile in bucket["profiles"]:
                 lines.append(
@@ -913,7 +1054,7 @@ def ensure_hyprland_hook(path: Path) -> bool:
 
 def write_lua(paths: Paths, store: dict[str, Any]) -> None:
     backup_file(paths.lua)
-    atomic_write(paths.lua, generate_lua(store))
+    atomic_write(paths.lua, generate_lua(store, home=paths.home, config=paths.config))
 
 
 def maybe_install_hyprland_hook(paths: Paths, store: dict[str, Any], *, force: bool = False) -> dict[str, Any]:
@@ -1095,7 +1236,7 @@ def build_profile_assignment(window: Window, profile: BrowserProfile, workspace:
         "class_regex": class_regex_for(window.class_name),
         "profile_directory": profile.directory,
         "profile_name": profile.name,
-        "user_data_dir": str(profile.user_data_dir),
+        "user_data_dir": portable_user_data_dir(profile.user_data_dir),
         "tag": tag_for_profile(window.class_name, profile.directory),
         "workspace": workspace,
         "label": window_label(window, profile),
@@ -1290,6 +1431,8 @@ def cmd_status(paths: Paths) -> int:
 
 def cmd_reload(paths: Paths) -> int:
     store = load_store(paths.assignments)
+    if _lstat(paths.assignments) is not None:
+        save_store(paths.assignments, store)
     write_lua(paths, store)
     errors = reload_hyprland()
     if errors:

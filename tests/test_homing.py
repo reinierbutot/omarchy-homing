@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 import importlib.machinery
 import importlib.util
+import json
 import os
 import stat
 import sys
@@ -110,7 +111,7 @@ class LuaTests(unittest.TestCase):
                 "class": "chromium",
                 "profile_directory": "Profile 1",
                 "profile_name": "Private",
-                "user_data_dir": "/home/reinier/.config/chromium",
+                "user_data_dir": "/home/user/.config/chromium",
                 "tag": "homing-chromium-profile-1",
                 "workspace": "5",
                 "label": "Chromium (Private)",
@@ -124,12 +125,50 @@ class LuaTests(unittest.TestCase):
         self.assertIn('match = { tag = "homing-chromium-profile-1" }', lua)
         self.assertIn('workspace = "5"', lua)
         self.assertIn("hl.dsp.window.move", lua)
-        self.assertIn("/home/reinier/.config/chromium", lua)
+        self.assertIn("homing_config_home", lua)
+        self.assertIn('homing_config_home .. "/chromium"', lua)
+        self.assertNotIn("/home/user/.config/chromium", lua)
+        self.assertNotIn("/home/reinier", lua)
         self.assertNotIn('*a', lua)
         self.assertIn("file:read(max_len)", lua)
         self.assertIn('homing_read("/proc/" .. tostring(pid) .. "/status", 65536)', lua)
         self.assertIn('homing_read("/proc/" .. tostring(current) .. "/cmdline", 65536)', lua)
         self.assertIn('homing_read("/proc/" .. tostring(current) .. "/maps", 2097152)', lua)
+
+    def test_profile_rule_home_relative_custom_dir(self):
+        store = H.empty_store()
+        H.upsert_assignment(
+            store,
+            {
+                "id": "profile:chromium:Default",
+                "kind": "profile",
+                "class": "chromium",
+                "profile_directory": "Default",
+                "user_data_dir": "/home/alice/chrome-work",
+                "tag": "homing-chromium-default",
+                "workspace": "2",
+            },
+        )
+        lua = H.generate_lua(store)
+        self.assertIn('homing_home .. "/chrome-work"', lua)
+        self.assertNotIn("/home/alice", lua)
+
+    def test_profile_rule_keeps_absolute_outside_home(self):
+        store = H.empty_store()
+        H.upsert_assignment(
+            store,
+            {
+                "id": "profile:chromium:Default",
+                "kind": "profile",
+                "class": "chromium",
+                "profile_directory": "Default",
+                "user_data_dir": "/mnt/ssd/chrome",
+                "tag": "homing-chromium-default",
+                "workspace": "2",
+            },
+        )
+        lua = H.generate_lua(store)
+        self.assertIn('user_data_dir = "/mnt/ssd/chrome"', lua)
 
     def test_lua_string_escapes(self):
         self.assertEqual(H.lua_string('a"b\\c'), r'"a\"b\\c"')
@@ -226,6 +265,97 @@ class HookTests(unittest.TestCase):
             self.assertFalse(paths.assignments.exists())
             self.assertFalse(homing_dir.exists())
             self.assertTrue(any(str(hyprland) == item for item in changed))
+
+
+class PortablePathTests(unittest.TestCase):
+    def test_config_dir_becomes_xdg_prefix(self):
+        home = Path("/home/ada")
+        config = home / ".config"
+        self.assertEqual(
+            H.portable_user_data_dir(config / "chromium", home=home, config=config),
+            "$XDG_CONFIG_HOME/chromium",
+        )
+        self.assertEqual(
+            H.portable_user_data_dir("/home/other/.config/google-chrome", home=home, config=config),
+            "$XDG_CONFIG_HOME/google-chrome",
+        )
+
+    def test_home_dir_becomes_tilde(self):
+        home = Path("/home/ada")
+        config = home / ".config"
+        self.assertEqual(
+            H.portable_user_data_dir("/home/ada/chrome-work", home=home, config=config),
+            "~/chrome-work",
+        )
+        self.assertEqual(
+            H.portable_user_data_dir("/home/other/chrome-work", home=home, config=config),
+            "~/chrome-work",
+        )
+
+    def test_absolute_outside_home_stays(self):
+        home = Path("/home/ada")
+        config = home / ".config"
+        self.assertEqual(
+            H.portable_user_data_dir("/mnt/ssd/chrome", home=home, config=config),
+            "/mnt/ssd/chrome",
+        )
+
+    def test_resolve_uses_current_home_and_config(self):
+        home = Path("/tmp/new-user")
+        config = Path("/tmp/new-user-config")
+        self.assertEqual(
+            H.resolve_user_data_dir("$XDG_CONFIG_HOME/chromium", home=home, config=config),
+            config / "chromium",
+        )
+        self.assertEqual(
+            H.resolve_user_data_dir("~/chrome-work", home=home, config=config),
+            home / "chrome-work",
+        )
+        self.assertEqual(
+            H.resolve_user_data_dir("/home/old/.config/chromium", home=home, config=config),
+            config / "chromium",
+        )
+
+    def test_load_store_migrates_absolute_profile_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "assignments.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "assignments": [
+                            {
+                                "id": "profile:chromium:Profile 1",
+                                "kind": "profile",
+                                "class": "chromium",
+                                "profile_directory": "Profile 1",
+                                "user_data_dir": "/home/reinier/.config/chromium",
+                            }
+                        ],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            store = H.load_store(path)
+            self.assertEqual(store["assignments"][0]["user_data_dir"], "$XDG_CONFIG_HOME/chromium")
+
+    def test_build_profile_assignment_stores_portable_path(self):
+        window = H.Window(
+            address="0x1",
+            class_name="chromium",
+            initial_class="chromium",
+            title="Chromium",
+            pid=None,
+            workspace="1",
+        )
+        profile = H.BrowserProfile(
+            directory="Profile 1",
+            name="Private",
+            user_data_dir=Path("/home/ada/.config/chromium"),
+        )
+        assignment = H.build_profile_assignment(window, profile, "5")
+        self.assertEqual(assignment["user_data_dir"], "$XDG_CONFIG_HOME/chromium")
 
 
 class FlagTests(unittest.TestCase):
