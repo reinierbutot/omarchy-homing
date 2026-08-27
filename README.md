@@ -66,7 +66,42 @@ StartupWMClass=chromium-prive
 
 Focus each browser window and run `homing pin` to assign it to its designated workspace. Homing will generate clean, static `hl.window_rule`s matching `class = "^(chromium-work)$"` and `class = "^(chromium-prive)$"`.
 
-### 2. Dynamic Single-Instance Profile Homing
+### 2. Browser Tab Discovery & Accessibility (AT-SPI / Everything)
+
+By default on Linux, Chromium disables its AT-SPI accessibility bridge to minimize memory overhead. When disabled, tab switchers and search plugins (such as Omarchy's **Everything** plugin) cannot discover or index open browser tabs across your profiles.
+
+To enable full browser tab discovery for all Chromium profiles:
+
+#### Quick Automated Fix
+Run Homing's built-in doctor command:
+```sh
+~/.config/omarchy/plugins/reinier.homing/bin/homing doctor --fix
+```
+Then close and restart any open Chromium browser instances.
+
+#### What this configures:
+1. **Desktop Toolkit Accessibility**:
+   Enables the AT-SPI desktop interface in GSettings so applications know the accessibility bus is active:
+   ```sh
+   gsettings set org.gnome.desktop.interface toolkit-accessibility true
+   ```
+2. **Persistent Environment Variable**:
+   Ensures `ACCESSIBILITY_ENABLED=1` is loaded in every desktop session via `~/.config/environment.d/accessibility.conf`:
+   ```sh
+   mkdir -p ~/.config/environment.d
+   echo "ACCESSIBILITY_ENABLED=1" >> ~/.config/environment.d/accessibility.conf
+   systemctl --user import-environment ACCESSIBILITY_ENABLED
+   dbus-update-activation-environment --systemd ACCESSIBILITY_ENABLED=1
+   ```
+3. **Chromium Launcher Flags**:
+   Appends `--force-renderer-accessibility` to `~/.config/chromium-flags.conf` so Chromium's web renderers always build accessibility trees for tab enumeration:
+   ```sh
+   echo "--force-renderer-accessibility" >> ~/.config/chromium-flags.conf
+   ```
+
+*Note on Web Apps / PWAs*: Windows launched in standalone app mode (`--app=https://...`, e.g. via `omarchy-launch-webapp`) do not possess a browser tab strip. Tab search tools like Everything intentionally treat PWA windows as top-level application windows rather than tab items.
+
+### 3. Dynamic Single-Instance Profile Homing
 
 If you share a single `~/.config/chromium` data directory without `--class` flags, all windows share the standard browser class (`chromium`). Homing detects the active profile by reading `/proc` (command line and mapped files) and checking `Local State`.
 
@@ -89,13 +124,15 @@ Profile rules tag the window on `window.open_early` (before window rules run) an
 ## Commands
 
 ```
-homing           # pin the focused window (default)
-homing unpin     # remove an assignment
-homing list
-homing status
-homing reload    # rewrite the Lua and hyprctl reload
-homing hook      # ask to add the one-line hyprland.lua loader
-homing uninstall # remove generated files and the hyprland.lua hook (asks first)
+homing                 # pin the focused window (default)
+homing unpin           # remove an assignment
+homing list            # list homed apps and workspaces
+homing status          # show focused window class, profile, and browser a11y status
+homing doctor          # diagnose hook, assignments, and tab discovery / AT-SPI setup
+homing doctor --fix    # automatically repair hook and configure browser tab discovery
+homing reload          # rewrite the Lua and hyprctl reload
+homing hook            # ask to add the one-line hyprland.lua loader
+homing uninstall       # remove generated files and the hyprland.lua hook (asks first)
 ```
 
 ## Why not `windowrulev2`?

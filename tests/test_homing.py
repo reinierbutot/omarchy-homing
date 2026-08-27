@@ -643,5 +643,85 @@ class SubprocessTests(unittest.TestCase):
         self.assertIsNone(H.run_limited(["homing-no-such-command"], timeout=1))
 
 
+class AccessibilityTests(unittest.TestCase):
+    def test_is_browser_class(self):
+        self.assertTrue(H.is_browser_class("chromium"))
+        self.assertTrue(H.is_browser_class("chromium-work"))
+        self.assertTrue(H.is_browser_class("chromium-prive"))
+        self.assertTrue(H.is_browser_class("google-chrome"))
+        self.assertTrue(H.is_browser_class("brave-browser"))
+        self.assertTrue(H.is_browser_class("vivaldi-stable"))
+        self.assertTrue(H.is_browser_class("helium"))
+        self.assertFalse(H.is_browser_class("slack"))
+        self.assertFalse(H.is_browser_class("ghostty"))
+        self.assertFalse(H.is_browser_class(""))
+
+    def test_check_accessibility_detects_flags_and_env(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / ".config"
+            env_dir = config / "environment.d"
+            env_dir.mkdir(parents=True)
+            flags_file = config / "chromium-flags.conf"
+            
+            paths = H.Paths(
+                home=root,
+                assignments=config / "omarchy" / "homing" / "assignments.json",
+                lua=config / "hypr" / "homing.lua",
+                hyprland_lua=config / "hypr" / "hyprland.lua",
+                chromium_flags=flags_file,
+                environment_d=env_dir,
+            )
+
+            # Initially missing
+            status = H.check_accessibility(paths)
+            self.assertFalse(status["chromium_flags"])
+            self.assertFalse(status["environment_d"])
+
+            # Add env and flags
+            (env_dir / "accessibility.conf").write_text("ACCESSIBILITY_ENABLED=1\n", encoding="utf-8")
+            flags_file.write_text("--ozone-platform=wayland\n--force-renderer-accessibility\n", encoding="utf-8")
+
+            status = H.check_accessibility(paths)
+            self.assertTrue(status["chromium_flags"])
+            self.assertTrue(status["environment_d"])
+
+    def test_fix_accessibility_applies_settings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / ".config"
+            env_dir = config / "environment.d"
+            flags_file = config / "chromium-flags.conf"
+            flags_file.parent.mkdir(parents=True)
+            flags_file.write_text("--ozone-platform=wayland\n", encoding="utf-8")
+
+            paths = H.Paths(
+                home=root,
+                assignments=config / "omarchy" / "homing" / "assignments.json",
+                lua=config / "hypr" / "homing.lua",
+                hyprland_lua=config / "hypr" / "hyprland.lua",
+                chromium_flags=flags_file,
+                environment_d=env_dir,
+            )
+
+            actions = H.fix_accessibility(paths)
+            self.assertTrue(any("ACCESSIBILITY_ENABLED=1" in a for a in actions))
+            self.assertTrue(any("--force-renderer-accessibility" in a for a in actions))
+
+            # Verify files
+            env_conf = env_dir / "accessibility.conf"
+            self.assertTrue(env_conf.is_file())
+            self.assertIn("ACCESSIBILITY_ENABLED=1", env_conf.read_text(encoding="utf-8"))
+
+            flags_text = flags_file.read_text(encoding="utf-8")
+            self.assertIn("--ozone-platform=wayland", flags_text)
+            self.assertIn("--force-renderer-accessibility", flags_text)
+
+            # Idempotent second run
+            actions2 = H.fix_accessibility(paths)
+            self.assertFalse(any("Wrote ACCESSIBILITY_ENABLED=1" in a for a in actions2))
+            self.assertFalse(any("Added --force-renderer-accessibility" in a for a in actions2))
+
+
 if __name__ == "__main__":
     unittest.main()

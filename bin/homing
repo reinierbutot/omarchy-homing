@@ -61,6 +61,8 @@ class Paths:
     assignments: Path
     lua: Path
     hyprland_lua: Path
+    chromium_flags: Path | None = None
+    environment_d: Path | None = None
 
     @classmethod
     def from_home(cls, home: Path | None = None) -> Paths:
@@ -71,11 +73,21 @@ class Paths:
             assignments=config / "omarchy" / "homing" / "assignments.json",
             lua=config / "hypr" / "homing.lua",
             hyprland_lua=config / "hypr" / "hyprland.lua",
+            chromium_flags=config / "chromium-flags.conf",
+            environment_d=config / "environment.d",
         )
 
     @property
     def config(self) -> Path:
         return self.assignments.parent.parent.parent
+
+    @property
+    def resolved_chromium_flags(self) -> Path:
+        return self.chromium_flags if self.chromium_flags is not None else self.config / "chromium-flags.conf"
+
+    @property
+    def resolved_environment_d(self) -> Path:
+        return self.environment_d if self.environment_d is not None else self.config / "environment.d"
 
 
 def default_config_home(home: Path | None = None) -> Path:
@@ -168,11 +180,24 @@ class BrowserProfile:
     user_data_dir: Path
 
 
+BROWSER_CLASS_PATTERN = re.compile(
+    r"(?:^|[._-])(?:chromium|google-chrome|chrome|brave(?:-browser)?|microsoft-edge|"
+    r"firefox|zen|vivaldi|helium|librewolf)(?=$|[._-])",
+    re.IGNORECASE,
+)
+
+
 def family_for_class(class_name: str) -> BrowserFamily | None:
     for family in BROWSER_FAMILIES:
         if family.class_re.match(class_name or ""):
             return family
     return None
+
+
+def is_browser_class(class_name: str) -> bool:
+    if family_for_class(class_name) is not None:
+        return True
+    return bool(BROWSER_CLASS_PATTERN.search(class_name or ""))
 
 
 def re2_escape(value: str) -> str:
@@ -1447,6 +1472,198 @@ def cmd_status(paths: Paths) -> int:
         print(f"homed: workspace {current.get('workspace')} ({current.get('id')})")
     else:
         print("homed: no")
+    if is_browser_class(window.class_name):
+        a11y = check_accessibility(paths)
+        if a11y.get("ready"):
+            print("tab discovery / a11y: ready (AT-SPI enabled)")
+        else:
+            print("tab discovery / a11y: disabled (run 'homing doctor --fix' to enable)")
+    return 0
+
+
+def check_accessibility(paths: Paths) -> dict[str, Any]:
+    """Check if desktop accessibility (AT-SPI) and Chromium browser flags are configured.
+
+    This ensures browser tabs can be discovered over AT-SPI / D-Bus by Omarchy plugins
+    (like Everything), accessibility tools, and window switchers.
+    """
+    gsettings_out = run_limited(
+        ["gsettings", "get", "org.gnome.desktop.interface", "toolkit-accessibility"],
+        timeout=3.0,
+    )
+    gsettings_enabled = False
+    if gsettings_out and gsettings_out.returncode == 0:
+        gsettings_enabled = "true" in (gsettings_out.stdout or "").lower()
+
+    env_dir = paths.resolved_environment_d
+    env_d_enabled = False
+    env_conf_path = env_dir / "accessibility.conf"
+    if env_dir.is_dir():
+        for conf in env_dir.glob("*.conf"):
+            text = read_regular_file(conf, max_bytes=MAX_TEXT_FILE_BYTES)
+            if text and re.search(r"^\s*ACCESSIBILITY_ENABLED\s*=\s*1", text, re.M):
+                env_d_enabled = True
+                env_conf_path = conf
+                break
+
+    env_var_enabled = os.environ.get("ACCESSIBILITY_ENABLED") == "1"
+
+    flags_file = paths.resolved_chromium_flags
+    flags_text = read_regular_file(flags_file, max_bytes=MAX_TEXT_FILE_BYTES) if flags_file.is_file() else ""
+    chromium_flags_enabled = "--force-renderer-accessibility" in flags_text
+
+    dbus_a11y_enabled: bool | None = None
+    gdbus_out = run_limited(
+        [
+            "gdbus",
+            "call",
+            "--session",
+            "--dest",
+            "org.a11y.Bus",
+            "--object-path",
+            "/org/a11y/bus",
+            "--method",
+            "org.freedesktop.DBus.Properties.Get",
+            "org.a11y.Status",
+            "IsEnabled",
+        ],
+        timeout=3.0,
+    )
+    if gdbus_out and gdbus_out.returncode == 0:
+        dbus_a11y_enabled = "true" in (gdbus_out.stdout or "").lower()
+
+    ready = bool(gsettings_enabled and (env_d_enabled or env_var_enabled) and chromium_flags_enabled)
+
+    return {
+        "ready": ready,
+        "gsettings": gsettings_enabled,
+        "environment_d": env_d_enabled,
+        "env_file": env_conf_path,
+        "env_var": env_var_enabled,
+        "chromium_flags": chromium_flags_enabled,
+        "chromium_flags_path": flags_file,
+        "dbus_a11y": dbus_a11y_enabled,
+    }
+
+
+def fix_accessibility(paths: Paths) -> list[str]:
+    """Configure desktop accessibility and Chromium flags for AT-SPI / Everything tab discovery."""
+    actions: list[str] = []
+
+    # 1. GSettings toolkit-accessibility
+    res = run_limited(
+        ["gsettings", "set", "org.gnome.desktop.interface", "toolkit-accessibility", "true"],
+        timeout=5.0,
+    )
+    if res and res.returncode == 0:
+        actions.append("Enabled GSettings org.gnome.desktop.interface toolkit-accessibility")
+
+    # 2. environment.d accessibility.conf
+    env_dir = paths.resolved_environment_d
+    env_conf = env_dir / "accessibility.conf"
+    status = check_accessibility(paths)
+    if not status["environment_d"]:
+        env_dir.mkdir(parents=True, exist_ok=True)
+        current_text = read_regular_file(env_conf, max_bytes=MAX_TEXT_FILE_BYTES) if env_conf.is_file() else ""
+        if current_text:
+            new_text = current_text.rstrip("\n") + "\nACCESSIBILITY_ENABLED=1\n"
+        else:
+            new_text = "ACCESSIBILITY_ENABLED=1\n"
+        atomic_write(env_conf, new_text)
+        actions.append(f"Wrote ACCESSIBILITY_ENABLED=1 to {env_conf}")
+
+    # 3. chromium-flags.conf
+    flags_file = paths.resolved_chromium_flags
+    flags_text = read_regular_file(flags_file, max_bytes=MAX_TEXT_FILE_BYTES) if flags_file.is_file() else ""
+    if "--force-renderer-accessibility" not in flags_text:
+        flags_file.parent.mkdir(parents=True, exist_ok=True)
+        if flags_text:
+            new_flags = flags_text.rstrip("\n") + "\n--force-renderer-accessibility\n"
+        else:
+            new_flags = "--force-renderer-accessibility\n"
+        atomic_write(flags_file, new_flags)
+        actions.append(f"Added --force-renderer-accessibility to {flags_file}")
+
+    # 4. Update session and activation environment
+    run_limited(["systemctl", "--user", "import-environment", "ACCESSIBILITY_ENABLED"], timeout=5.0)
+    run_limited(["dbus-update-activation-environment", "--systemd", "ACCESSIBILITY_ENABLED=1"], timeout=5.0)
+    actions.append("Updated systemd and D-Bus activation environments with ACCESSIBILITY_ENABLED=1")
+
+    return actions
+
+
+def cmd_doctor(paths: Paths, fix: bool = False) -> int:
+    store = load_store(paths.assignments)
+    assignments = store.get("assignments") or []
+    current_hook = read_regular_file(paths.hyprland_lua, max_bytes=MAX_TEXT_FILE_BYTES)
+    hook_present = current_hook is not None and hyprland_has_hook(current_hook)
+
+    a11y = check_accessibility(paths)
+
+    issues: list[str] = []
+
+    print("Homing Diagnostics:")
+    print("-------------------")
+
+    # Hook check
+    if hook_present:
+        print(f"[{ICON_OK}] Hyprland hook: active in {paths.hyprland_lua}")
+    else:
+        print(f"[{ICON_WARN}] Hyprland hook: missing in {paths.hyprland_lua}")
+        issues.append("Hyprland hook is missing (homing rules will not load).")
+
+    # Assignments check
+    print(f"[{ICON_OK}] Assignments: {len(assignments)} saved assignment(s)")
+
+    # Browser Accessibility & Tab Discovery check
+    print("\nBrowser Accessibility & Tab Discovery (AT-SPI / Everything):")
+    if a11y["gsettings"]:
+        print(f"  [{ICON_OK}] GSettings toolkit-accessibility: enabled")
+    else:
+        print(f"  [{ICON_WARN}] GSettings toolkit-accessibility: disabled")
+        issues.append("GSettings toolkit-accessibility is disabled.")
+
+    if a11y["environment_d"]:
+        print(f"  [{ICON_OK}] Environment (environment.d): ACCESSIBILITY_ENABLED=1 in {a11y['env_file']}")
+    else:
+        print(f"  [{ICON_WARN}] Environment (environment.d): ACCESSIBILITY_ENABLED=1 missing in ~/.config/environment.d/")
+        issues.append("ACCESSIBILITY_ENABLED=1 missing from ~/.config/environment.d/.")
+
+    if a11y["chromium_flags"]:
+        print(f"  [{ICON_OK}] Chromium flags: --force-renderer-accessibility present in {a11y['chromium_flags_path']}")
+    else:
+        print(f"  [{ICON_WARN}] Chromium flags: --force-renderer-accessibility missing in {a11y['chromium_flags_path']}")
+        issues.append("Chromium flags missing --force-renderer-accessibility.")
+
+    if a11y["dbus_a11y"] is not None:
+        if a11y["dbus_a11y"]:
+            print(f"  [{ICON_OK}] Session D-Bus a11y bus: active")
+        else:
+            print(f"  [{ICON_WARN}] Session D-Bus a11y bus: inactive")
+
+    if fix:
+        print("\nApplying fixes…")
+        fixed_actions: list[str] = []
+        if not hook_present and paths.hyprland_lua.is_file():
+            store = maybe_install_hyprland_hook(paths, store, force=True)
+            save_store(paths.assignments, store)
+            if store.get("hyprlandHook") == "installed":
+                fixed_actions.append(f"Added hook to {paths.hyprland_lua}")
+                reload_hyprland()
+
+        fixed_actions.extend(fix_accessibility(paths))
+        for action in fixed_actions:
+            print(f"  [{ICON_OK}] {action}")
+        print("\nNote: Restart any running Chromium browser instances so changes take effect.")
+        notify("Homing", "Repairs applied. Restart Chromium for tabs to appear in Everything.")
+        return 0
+
+    if issues:
+        print(f"\n[{ICON_WARN}] Found {len(issues)} issue(s).")
+        print("Run 'homing doctor --fix' to automatically resolve them.")
+        return 1
+
+    print(f"\n[{ICON_OK}] Everything is configured correctly!")
     return 0
 
 
@@ -1525,7 +1742,8 @@ Commands:
   pin        Home the focused window (default)
   unpin      Remove an assignment
   list       Print saved assignments
-  status     Show the focused window's identity and assignment
+  status     Show the focused window's identity, assignment, and browser a11y status
+  doctor     Diagnose setup, Hyprland hook, and browser tab discovery (use --fix to repair)
   reload     Rewrite ~/.config/hypr/homing.lua and reload Hyprland
   hook       Ask to add the one-line hyprland.lua loader
   uninstall  Remove generated files and the hyprland.lua hook (asks first)
@@ -1547,6 +1765,9 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_list(paths)
     if command == "status":
         return cmd_status(paths)
+    if command in {"doctor", "check"}:
+        fix_flag = "--fix" in args[1:]
+        return cmd_doctor(paths, fix=fix_flag)
     if command == "reload":
         return cmd_reload(paths)
     if command == "hook":
