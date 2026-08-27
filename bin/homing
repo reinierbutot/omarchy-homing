@@ -330,13 +330,21 @@ def parse_flag(cmdline: str, flag: str) -> str | None:
         cut = re.search(r"\s+--", value)
         if cut:
             value = value[: cut.start()].strip()
+        if len(value) >= 2 and ((value[0] == '"' and value[-1] == '"') or (value[0] == "'" and value[-1] == "'")):
+            value = value[1:-1].strip()
         return value or None
     match = re.search(rf"{re.escape(flag)}(?:\n|\s+)(\S+(?: \S+?)?)", cmdline)
     if match:
-        return match.group(1).strip() or None
+        value = match.group(1).strip()
+        if len(value) >= 2 and ((value[0] == '"' and value[-1] == '"') or (value[0] == "'" and value[-1] == "'")):
+            value = value[1:-1].strip()
+        return value or None
     match = re.search(rf"{re.escape(flag)}=(\S+(?: \d+)?)", joined)
     if match:
-        return match.group(1).strip() or None
+        value = match.group(1).strip()
+        if len(value) >= 2 and ((value[0] == '"' and value[-1] == '"') or (value[0] == "'" and value[-1] == "'")):
+            value = value[1:-1].strip()
+        return value or None
     return None
 
 
@@ -823,19 +831,32 @@ local function homing_ppid(pid)
   return tonumber(status:match("PPid:%s*(%d+)"))
 end
 
+local function homing_strip_quotes(text)
+  if not text then return nil end
+  local clean = text:match("^%s*(.-)%s*$")
+  if clean and #clean >= 2 then
+    local first = clean:sub(1, 1)
+    local last = clean:sub(-1, -1)
+    if (first == '"' and last == '"') or (first == "'" and last == "'") then
+      clean = clean:sub(2, -2):match("^%s*(.-)%s*$")
+    end
+  end
+  return clean
+end
+
 local function homing_profile_from_cmdline(text)
   if not text or text == "" then return nil end
   local dir = text:match("%-%-profile%-directory=([^\n]+)")
   if dir then
     local cut = dir:find(" %-%-", 1, true)
     if cut then dir = dir:sub(1, cut - 1) end
-    dir = dir:match("^%s*(.-)%s*$")
+    dir = homing_strip_quotes(dir)
     if dir and dir ~= "" then return dir end
   end
   dir = text:match("%-%-profile%-directory[\n ]+([^\n]+)")
   if dir then
     dir = dir:match("^(%S+(?: %d+)?)") or dir
-    dir = dir:match("^%s*(.-)%s*$")
+    dir = homing_strip_quotes(dir)
     if dir and dir ~= "" then return dir end
   end
   return nil

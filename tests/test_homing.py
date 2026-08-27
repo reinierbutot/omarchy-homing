@@ -42,6 +42,12 @@ class RegexTests(unittest.TestCase):
         self.assertIn(H.re2_escape(pwa), H.class_regex_for(pwa))
         self.assertIsNone(H.family_for_class(pwa))
 
+    def test_custom_browser_class_is_exact(self):
+        self.assertEqual(H.class_regex_for("chromium-work"), r"^(chromium-work)$")
+        self.assertEqual(H.class_regex_for("chromium-prive"), r"^(chromium-prive)$")
+        self.assertIsNone(H.family_for_class("chromium-work"))
+        self.assertIsNone(H.family_for_class("chromium-prive"))
+
 
 class AssignmentTests(unittest.TestCase):
     def test_ids_and_tags(self):
@@ -134,6 +140,7 @@ class LuaTests(unittest.TestCase):
         self.assertIn('homing_read("/proc/" .. tostring(pid) .. "/status", 65536)', lua)
         self.assertIn('homing_read("/proc/" .. tostring(current) .. "/cmdline", 65536)', lua)
         self.assertIn('homing_read("/proc/" .. tostring(current) .. "/maps", 2097152)', lua)
+        self.assertIn("homing_strip_quotes", lua)
 
     def test_profile_rule_home_relative_custom_dir(self):
         store = H.empty_store()
@@ -374,6 +381,20 @@ class FlagTests(unittest.TestCase):
         self.assertEqual(
             H.parse_flag("--user-data-dir=/tmp/chrome-work --bar", "--user-data-dir"),
             "/tmp/chrome-work",
+        )
+
+    def test_quoted_flags(self):
+        self.assertEqual(
+            H.parse_flag('--profile-directory="Profile 1" --foo', "--profile-directory"),
+            "Profile 1",
+        )
+        self.assertEqual(
+            H.parse_flag("--profile-directory='Profile 1' --foo", "--profile-directory"),
+            "Profile 1",
+        )
+        self.assertEqual(
+            H.parse_flag('--user-data-dir="/tmp/chrome work" --bar', "--user-data-dir"),
+            "/tmp/chrome work",
         )
 
 

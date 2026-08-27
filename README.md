@@ -24,50 +24,57 @@ Optional keybind in `~/.config/hypr/bindings.lua`:
 o.bind("SUPER + SHIFT + H", "Home this app to a workspace", os.getenv("HOME") .. "/.config/omarchy/plugins/reinier.homing/bin/homing")
 ```
 
-## Chromium profiles
+## Chromium profiles & shortcuts
 
-Chromium, Chrome, Brave, Edge, Vivaldi, and Helium share one window class across profiles. Homing reads `/proc` (command line, mapped files) to find `--profile-directory` / the profile folder, then looks up the friendly name in `Local State`.
+Chromium-based browsers (Chromium, Chrome, Brave, Edge, Vivaldi, Helium) can be homed in two ways:
 
-You can home:
+### 1. Isolated Profiles with Custom Window Classes (Recommended)
 
-- every window of that browser, or
-- only this profile (for example Chromium **Work** vs **Private**)
+Chromium runs a single master process per `--user-data-dir`. If two shortcuts share the same user data directory (`~/.config/chromium`), Chromium forwards subsequent launches to the running master process via IPC, causing subsequent windows to inherit the master process's PID and Wayland window class.
 
-## Homing Chromium Profile (Shortcuts)
+To give each profile completely independent processes and distinct window classes (`chromium-work`, `chromium-prive`) that match fast native Hyprland window rules, specify a dedicated `--user-data-dir`, `--profile-directory`, and `--class` (with matching `StartupWMClass`):
 
-First, look up the 'Profile Path' on the `chrome://version` page of your Chromium profile. That is typically `~/.config/chromium/Default` for the first profile and `~/.config/chromium/Profile 1` for a second one. Use the directory name (`Default` and `Profile 1` in this example) in each `.desktop` file so the shortcuts stay distinct.
-
-My Work Shortcut file:
-```
+**Work shortcut (`~/.local/share/applications/chromium-work.desktop`):**
+```ini
 [Desktop Entry]
 Version=1.0
 Type=Application
 Name=Chromium (Work)
 Comment=Launch Chromium Work Profile
-Exec=chromium --profile-directory="Default" --class="chromium-work" %U
+Exec=chromium --user-data-dir=/home/username/.config/chromium-work --profile-directory="Default" --class="chromium-work" %U
 Icon=chromium
 Terminal=false
 StartupNotify=true
 Categories=Network;WebBrowser;
-StartupWMClass=chromium (Default)
+StartupWMClass=chromium-work
 ```
 
-My Private Shortcut file :
-```
+**Private shortcut (`~/.local/share/applications/chromium-prive.desktop`):**
+```ini
 [Desktop Entry]
 Version=1.0
 Type=Application
 Name=Chromium (Prive)
 Comment=Launch Chromium Prive Profile
-Exec=chromium --profile-directory="Profile 1" --class="chromium-prive" %U
+Exec=chromium --user-data-dir=/home/username/.config/chromium-prive --profile-directory="Profile 1" --class="chromium-prive" %U
 Icon=chromium
 Terminal=false
 StartupNotify=true
 Categories=Network;WebBrowser;
-StartupWMClass=chromium (Profile 1)
+StartupWMClass=chromium-prive
 ```
 
-Profile rules tag the window on `window.open_early` (before window rules run) and then send that tag to a workspace. Class rules still win for everything else.
+Focus each browser window and run `homing pin` to assign it to its designated workspace. Homing will generate clean, static `hl.window_rule`s matching `class = "^(chromium-work)$"` and `class = "^(chromium-prive)$"`.
+
+### 2. Dynamic Single-Instance Profile Homing
+
+If you share a single `~/.config/chromium` data directory without `--class` flags, all windows share the standard browser class (`chromium`). Homing detects the active profile by reading `/proc` (command line and mapped files) and checking `Local State`.
+
+When pinning, Homing will ask whether you want to home:
+- every window of that browser, or
+- only this specific profile (e.g. **Work** vs **Private**)
+
+Profile rules tag the window on `window.open_early` (before window rules run) and move that tag to the designated workspace. Class rules still apply for regular apps.
 
 ## Files
 
