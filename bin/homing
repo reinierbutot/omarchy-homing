@@ -1391,6 +1391,10 @@ def cmd_pin(paths: Paths) -> int:
         assignment = build_class_assignment(window, workspace)
     upsert_assignment(store, assignment)
     store = maybe_install_hyprland_hook(paths, store)
+    if is_browser_class(window.class_name):
+        store, a11y_actions = maybe_install_accessibility(paths, store)
+        if a11y_actions:
+            notify("Homing", "Tab discovery configured. Restart Chromium to apply.", ICON_OK)
     errors = persist(paths, store)
     move_window(workspace)
     label = assignment["label"]
@@ -1592,6 +1596,41 @@ def fix_accessibility(paths: Paths) -> list[str]:
     return actions
 
 
+def maybe_install_accessibility(
+    paths: Paths,
+    store: dict[str, Any],
+    force: bool = False,
+) -> tuple[dict[str, Any], list[str]]:
+    """Prompt the user with a confirmation dialog before modifying external accessibility or browser settings."""
+    a11y = check_accessibility(paths)
+    if a11y.get("ready"):
+        store["accessibilitySetup"] = "installed"
+        return store, []
+    if not force and store.get("accessibilitySetup") == "declined":
+        return store, []
+
+    choice = menu_select(
+        "Allow Homing to configure Chromium tab discovery (AT-SPI)?",
+        [
+            f"{ICON_OK}\tYes, enable tab discovery (writes environment.d/ & chromium-flags.conf)\tyes",
+            f"{ICON_STOP}\tNo, leave external browser & environment settings untouched\tno",
+        ],
+        width=560,
+    )
+    if choice == "yes":
+        actions = fix_accessibility(paths)
+        store["accessibilitySetup"] = "installed"
+        return store, actions
+    if choice == "no":
+        store["accessibilitySetup"] = "declined"
+        notify(
+            "Homing",
+            "Tab discovery skipped. External configuration files were not modified.",
+            ICON_WARN,
+        )
+    return store, []
+
+
 def cmd_doctor(paths: Paths, fix: bool = False) -> int:
     store = load_store(paths.assignments)
     assignments = store.get("assignments") or []
@@ -1651,11 +1690,20 @@ def cmd_doctor(paths: Paths, fix: bool = False) -> int:
                 fixed_actions.append(f"Added hook to {paths.hyprland_lua}")
                 reload_hyprland()
 
-        fixed_actions.extend(fix_accessibility(paths))
-        for action in fixed_actions:
-            print(f"  [{ICON_OK}] {action}")
-        print("\nNote: Restart any running Chromium browser instances so changes take effect.")
-        notify("Homing", "Repairs applied. Restart Chromium for tabs to appear in Everything.")
+        store, a11y_actions = maybe_install_accessibility(paths, store, force=True)
+        save_store(paths.assignments, store)
+        fixed_actions.extend(a11y_actions)
+
+        if fixed_actions:
+            for action in fixed_actions:
+                print(f"  [{ICON_OK}] {action}")
+            print("\nNote: Restart any running Chromium browser instances so changes take effect.")
+            notify("Homing", "Repairs applied. Restart Chromium for tabs to appear in Everything.")
+        else:
+            if store.get("accessibilitySetup") == "declined":
+                print("  Tab discovery setup declined. External settings left untouched.")
+            else:
+                print("  No changes made.")
         return 0
 
     if issues:

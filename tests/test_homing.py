@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -721,6 +722,84 @@ class AccessibilityTests(unittest.TestCase):
             actions2 = H.fix_accessibility(paths)
             self.assertFalse(any("Wrote ACCESSIBILITY_ENABLED=1" in a for a in actions2))
             self.assertFalse(any("Added --force-renderer-accessibility" in a for a in actions2))
+
+    def test_maybe_install_accessibility_user_accepts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / ".config"
+            env_dir = config / "environment.d"
+            flags_file = config / "chromium-flags.conf"
+
+            paths = H.Paths(
+                home=root,
+                assignments=config / "omarchy" / "homing" / "assignments.json",
+                lua=config / "hypr" / "homing.lua",
+                hyprland_lua=config / "hypr" / "hyprland.lua",
+                chromium_flags=flags_file,
+                environment_d=env_dir,
+            )
+
+            store = {"assignments": []}
+            with unittest.mock.patch.object(H, "menu_select", return_value="yes"):
+                updated_store, actions = H.maybe_install_accessibility(paths, store)
+
+            self.assertEqual(updated_store.get("accessibilitySetup"), "installed")
+            self.assertTrue(len(actions) > 0)
+            self.assertTrue((env_dir / "accessibility.conf").is_file())
+
+    def test_maybe_install_accessibility_user_declines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / ".config"
+            env_dir = config / "environment.d"
+            flags_file = config / "chromium-flags.conf"
+
+            paths = H.Paths(
+                home=root,
+                assignments=config / "omarchy" / "homing" / "assignments.json",
+                lua=config / "hypr" / "homing.lua",
+                hyprland_lua=config / "hypr" / "hyprland.lua",
+                chromium_flags=flags_file,
+                environment_d=env_dir,
+            )
+
+            store = {"assignments": []}
+            with unittest.mock.patch.object(H, "menu_select", return_value="no"):
+                updated_store, actions = H.maybe_install_accessibility(paths, store)
+
+            self.assertEqual(updated_store.get("accessibilitySetup"), "declined")
+            self.assertEqual(actions, [])
+            self.assertFalse((env_dir / "accessibility.conf").exists())
+
+            # Subsequent call does not prompt unless forced
+            with unittest.mock.patch.object(H, "menu_select") as mock_menu:
+                updated_store2, actions2 = H.maybe_install_accessibility(paths, updated_store)
+                mock_menu.assert_not_called()
+                self.assertEqual(actions2, [])
+
+    def test_maybe_install_accessibility_user_cancels(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / ".config"
+            env_dir = config / "environment.d"
+            flags_file = config / "chromium-flags.conf"
+
+            paths = H.Paths(
+                home=root,
+                assignments=config / "omarchy" / "homing" / "assignments.json",
+                lua=config / "hypr" / "homing.lua",
+                hyprland_lua=config / "hypr" / "hyprland.lua",
+                chromium_flags=flags_file,
+                environment_d=env_dir,
+            )
+
+            store = {"assignments": []}
+            with unittest.mock.patch.object(H, "menu_select", return_value=None):
+                updated_store, actions = H.maybe_install_accessibility(paths, store)
+
+            self.assertNotIn("accessibilitySetup", updated_store)
+            self.assertEqual(actions, [])
+            self.assertFalse((env_dir / "accessibility.conf").exists())
 
 
 if __name__ == "__main__":
